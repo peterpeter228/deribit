@@ -32,6 +32,8 @@ from .models import PlaceOrderRequest
 from .tools import (
     account_summary,
     cancel_order,
+    compute_gamma_exposure,
+    compute_max_pain,
     deribit_instruments,
     deribit_orderbook_summary,
     deribit_status,
@@ -39,6 +41,10 @@ from .tools import (
     dvol_snapshot,
     expected_move_iv,
     funding_snapshot,
+    get_iv_term_structure,
+    get_open_interest_by_strike,
+    get_option_chain,
+    get_skew_metrics,
     open_orders,
     options_surface_snapshot,
     place_order,
@@ -215,6 +221,128 @@ def get_public_tools() -> list[Tool]:
                         "type": "string",
                         "enum": ["BTC", "ETH"],
                         "description": "Currency: BTC or ETH",
+                    },
+                },
+                "required": ["currency"],
+            },
+        ),
+        # =====================================================================
+        # Options Analytics Tools
+        # =====================================================================
+        Tool(
+            name="get_option_chain",
+            description="Get option chain for a specific expiry. Returns strikes with mark_iv (decimal 0-1), delta, gamma, vega, open_interest, volume. Output is compact (≤2KB).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "currency": {
+                        "type": "string",
+                        "enum": ["BTC", "ETH"],
+                        "description": "Currency: BTC or ETH",
+                    },
+                    "expiry": {
+                        "type": "string",
+                        "description": "Expiry label (e.g., '28JUN24', '27DEC24')",
+                    },
+                },
+                "required": ["currency", "expiry"],
+            },
+        ),
+        Tool(
+            name="get_open_interest_by_strike",
+            description="Get open interest aggregated by strike for an expiry. Returns OI distribution, peak range, and top 5 strikes by OI concentration.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "currency": {
+                        "type": "string",
+                        "enum": ["BTC", "ETH"],
+                        "description": "Currency: BTC or ETH",
+                    },
+                    "expiry": {
+                        "type": "string",
+                        "description": "Expiry label (e.g., '28JUN24')",
+                    },
+                },
+                "required": ["currency", "expiry"],
+            },
+        ),
+        Tool(
+            name="compute_gamma_exposure",
+            description="Calculate gamma exposure (GEX) profile. Returns GEX by strike, net_gex, gamma_flip_level, and MM positioning. Positive GEX = stabilizing, negative = destabilizing. Units: M$ (millions).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "currency": {
+                        "type": "string",
+                        "enum": ["BTC", "ETH"],
+                        "description": "Currency: BTC or ETH",
+                    },
+                    "expiries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of expiry labels (e.g., ['28JUN24', '27DEC24']). If omitted, uses nearest 3 expiries.",
+                    },
+                },
+                "required": ["currency"],
+            },
+        ),
+        Tool(
+            name="compute_max_pain",
+            description="Calculate max pain strike for an expiry. Max pain = price where option buyers have maximum loss. Returns max_pain_strike, distance from spot, put/call ratio.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "currency": {
+                        "type": "string",
+                        "enum": ["BTC", "ETH"],
+                        "description": "Currency: BTC or ETH",
+                    },
+                    "expiry": {
+                        "type": "string",
+                        "description": "Expiry label (e.g., '28JUN24')",
+                    },
+                },
+                "required": ["currency", "expiry"],
+            },
+        ),
+        Tool(
+            name="get_iv_term_structure",
+            description="Get ATM IV term structure across tenors. Returns IV at each tenor, slope (IV change per 30 days), shape (contango/backwardation). IV in decimal (0.80 = 80%).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "currency": {
+                        "type": "string",
+                        "enum": ["BTC", "ETH"],
+                        "description": "Currency: BTC or ETH",
+                    },
+                    "tenors_days": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "default": [7, 14, 30, 60, 90],
+                        "description": "Target tenors in days",
+                    },
+                },
+                "required": ["currency"],
+            },
+        ),
+        Tool(
+            name="get_skew_metrics",
+            description="Get volatility skew metrics (RR25d, BF25d) across tenors. RR25d = Call_IV - Put_IV (positive=bullish). BF25d = wing premium over ATM. Returns skew direction and trend.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "currency": {
+                        "type": "string",
+                        "enum": ["BTC", "ETH"],
+                        "description": "Currency: BTC or ETH",
+                    },
+                    "tenors_days": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "default": [7, 30],
+                        "description": "Target tenors in days",
                     },
                 },
                 "required": ["currency"],
@@ -443,6 +571,49 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any]) -> dict:
     elif name == "funding_snapshot":
         return await funding_snapshot(
             currency=arguments["currency"],
+            client=client,
+        )
+
+    # Options Analytics tools
+    elif name == "get_option_chain":
+        return await get_option_chain(
+            currency=arguments["currency"],
+            expiry=arguments["expiry"],
+            client=client,
+        )
+
+    elif name == "get_open_interest_by_strike":
+        return await get_open_interest_by_strike(
+            currency=arguments["currency"],
+            expiry=arguments["expiry"],
+            client=client,
+        )
+
+    elif name == "compute_gamma_exposure":
+        return await compute_gamma_exposure(
+            currency=arguments["currency"],
+            expiries=arguments.get("expiries"),
+            client=client,
+        )
+
+    elif name == "compute_max_pain":
+        return await compute_max_pain(
+            currency=arguments["currency"],
+            expiry=arguments["expiry"],
+            client=client,
+        )
+
+    elif name == "get_iv_term_structure":
+        return await get_iv_term_structure(
+            currency=arguments["currency"],
+            tenors_days=arguments.get("tenors_days"),
+            client=client,
+        )
+
+    elif name == "get_skew_metrics":
+        return await get_skew_metrics(
+            currency=arguments["currency"],
+            tenors_days=arguments.get("tenors_days"),
             client=client,
         )
 

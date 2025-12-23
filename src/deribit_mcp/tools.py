@@ -10,38 +10,68 @@ import time
 from typing import Any, Literal
 
 from .analytics import (
+    OptionData,
+    SkewMetrics,
+    aggregate_oi_by_strike,
+    analyze_term_structure_shape,
     calculate_butterfly,
     calculate_expected_move,
+    calculate_gamma_exposure_profile,
     calculate_imbalance,
+    calculate_iv_term_structure_slope,
+    calculate_max_pain,
     calculate_risk_reversal,
     days_to_expiry_from_ts,
+    determine_skew_direction,
+    determine_skew_trend,
     dvol_to_decimal,
+    estimate_25d_strike,
+    find_oi_peak_range,
+    find_oi_peaks,
     spread_in_bps,
+)
+from .analytics import (
+    TermStructurePoint as TSPoint,
 )
 from .client import DeribitError, DeribitJsonRpcClient, get_client
 from .config import Currency, InstrumentKind, get_settings
 from .models import (
     AccountSummaryResponse,
     DvolResponse,
-    ErrorResponse,
     ExpectedMoveResponse,
     FundingEntry,
     FundingResponse,
+    GammaExposureResponse,
     GreeksCompact,
     InstrumentCompact,
     InstrumentsResponse,
+    IVTermStructureResponse,
+    MaxPainResponse,
+    OIPeakInfo,
+    OpenInterestByStrikeResponse,
     OpenOrdersResponse,
+    OptionChainResponse,
+    OptionStrikeData,
     OrderBookSummaryResponse,
     OrderCompact,
+    PainCurvePoint,
     PlaceOrderRequest,
     PlaceOrderResponse,
     PositionCompact,
     PositionsResponse,
     PriceLevel,
+    SkewMetricsResponse,
     StatusResponse,
+    StrikeGEX,
+    StrikeOIData,
     SurfaceResponse,
     TenorIV,
+    TenorSkew,
+    TermStructurePoint,
     TickerResponse,
+)
+from .models import (
+    ErrorResponseLegacy as ErrorResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -408,10 +438,6 @@ async def dvol_snapshot(
     """
     client = client or get_client()
     notes: list[str] = []
-
-    # DVOL index names
-    dvol_index = f"{currency}_DVOL" if currency == "BTC" else f"{currency}DVOL"
-    dvol_index_alt = f"{currency}DVOL" if currency == "BTC" else f"{currency}_DVOL"
 
     try:
         # Try to get DVOL index data
@@ -936,6 +962,1130 @@ async def funding_snapshot(
             code=e.code,
             message=e.message[:100],
             notes=[f"perp:{perp_name}", "funding_fetch_failed"],
+        ).model_dump()
+
+
+# =============================================================================
+# Tool 9: get_option_chain
+# =============================================================================
+
+
+async def get_option_chain(
+    currency: Currency,
+    expiry: str,
+    client: DeribitJsonRpcClient | None = None,
+) -> dict:
+    """
+    Get option chain for a specific expiry.
+
+    Returns strike list with mark_iv, delta, gamma, vega, open_interest, volume.
+    Designed for compact output suitable for LLM consumption.
+
+    Args:
+        currency: BTC or ETH
+        expiry: Expiry label (e.g., "28JUN24", "27DEC24")
+
+    Returns:
+        OptionChainResponse with strike data and summary
+    """
+    client = client or get_client()
+    notes: list[str] = []
+
+    try:
+        # Get spot price
+        index_result = await client.call_public(
+            "public/get_index_price", {"index_name": f"{currency.lower()}_usd"}
+        )
+        spot = _safe_float(index_result.get("index_price", 0))
+
+        if not spot or spot <= 0:
+            return ErrorResponse(
+                code=-1,
+                message="Could not fetch spot price",
+                notes=["spot_unavailable"],
+            ).model_dump()
+
+        # Get instruments for this expiry
+        instruments_result = await client.call_public(
+            "public/get_instruments",
+            {"currency": currency, "kind": "option", "expired": False},
+        )
+
+        all_options = instruments_result if isinstance(instruments_result, list) else []
+
+        # Filter by expiry
+        expiry_upper = expiry.upper()
+        matching_options = []
+        expiry_ts = 0
+
+        for opt in all_options:
+            inst_name = opt.get("instrument_name", "")
+            # Format: BTC-28JUN24-50000-C
+            parts = inst_name.split("-")
+            if len(parts) >= 3 and parts[1].upper() == expiry_upper:
+                matching_options.append(opt)
+                if expiry_ts == 0:
+                    expiry_ts = opt.get("expiration_timestamp", 0)
+
+        if not matching_options:
+            return ErrorResponse(
+                code=404,
+                message=f"No options found for expiry: {expiry}",
+                notes=[f"currency:{currency}", f"expiry:{expiry}"],
+            ).model_dump()
+
+        current_ts = _current_ts_ms()
+        days_to_expiry = days_to_expiry_from_ts(expiry_ts, current_ts)
+
+        # Get ticker data for each option (limited to avoid rate limits)
+        # Only fetch for unique strikes, prioritize ATM
+        strikes_set = set()
+        for opt in matching_options:
+            strike = opt.get("strike")
+            if strike:
+                strikes_set.add(strike)
+
+        strikes_sorted = sorted(strikes_set)
+
+        # Find ATM strike
+        atm_strike = None
+        min_distance = float("inf")
+        for s in strikes_sorted:
+            dist = abs(s - spot)
+            if dist < min_distance:
+                min_distance = dist
+                atm_strike = s
+
+        # Limit strikes around ATM for compact output
+        atm_idx = strikes_sorted.index(atm_strike) if atm_strike in strikes_sorted else len(strikes_sorted) // 2
+        start_idx = max(0, atm_idx - 10)
+        end_idx = min(len(strikes_sorted), atm_idx + 11)
+        selected_strikes = set(strikes_sorted[start_idx:end_idx])
+
+        if len(strikes_sorted) > 21:
+            notes.append(f"strikes_limited:{len(selected_strikes)}_of_{len(strikes_sorted)}")
+
+        # Fetch tickers for selected options
+        option_data: list[OptionStrikeData] = []
+        total_oi = 0.0
+        total_vol = 0.0
+        iv_sum = 0.0
+        iv_count = 0
+
+        for opt in matching_options:
+            strike = opt.get("strike")
+            if strike not in selected_strikes:
+                continue
+
+            inst_name = opt.get("instrument_name", "")
+            opt_type = opt.get("option_type", "call")
+
+            try:
+                ticker = await client.call_public(
+                    "public/ticker", {"instrument_name": inst_name}
+                )
+
+                iv = _safe_float(ticker.get("mark_iv"))
+                if iv and iv > 1:
+                    iv = iv / 100  # Convert percentage to decimal
+
+                greeks = ticker.get("greeks", {})
+                oi = _safe_float(ticker.get("open_interest"))
+                vol = _safe_float(ticker.get("stats", {}).get("volume"))
+
+                option_data.append(
+                    OptionStrikeData(
+                        strike=strike,
+                        type=opt_type,
+                        mark_iv=_round_or_none(iv, 4),
+                        delta=_round_or_none(_safe_float(greeks.get("delta")), 4),
+                        gamma=_round_or_none(_safe_float(greeks.get("gamma")), 6),
+                        vega=_round_or_none(_safe_float(greeks.get("vega")), 4),
+                        oi=_round_or_none(oi, 2),
+                        vol=_round_or_none(vol, 2),
+                    )
+                )
+
+                if oi:
+                    total_oi += oi
+                if vol:
+                    total_vol += vol
+                if iv:
+                    iv_sum += iv
+                    iv_count += 1
+
+            except DeribitError:
+                notes.append(f"ticker_error:{inst_name[:20]}")
+                continue
+
+        # Sort by strike then type
+        option_data.sort(key=lambda x: (x.strike, x.type))
+
+        # Summary
+        summary = {
+            "total_oi": round(total_oi, 2),
+            "total_volume": round(total_vol, 2),
+            "avg_iv": round(iv_sum / iv_count, 4) if iv_count > 0 else None,
+            "num_strikes": len(selected_strikes),
+        }
+
+        return OptionChainResponse(
+            ccy=currency,
+            expiry=expiry_upper,
+            expiry_ts=expiry_ts,
+            spot=round(spot, 2),
+            atm_strike=atm_strike,
+            days_to_expiry=round(days_to_expiry, 2),
+            strikes=option_data[:100],
+            summary=summary,
+            notes=notes[:6],
+        ).model_dump()
+
+    except DeribitError as e:
+        return ErrorResponse(
+            code=e.code,
+            message=e.message[:100],
+            notes=[f"currency:{currency}", f"expiry:{expiry}"],
+        ).model_dump()
+
+
+# =============================================================================
+# Tool 10: get_open_interest_by_strike
+# =============================================================================
+
+
+async def get_open_interest_by_strike(
+    currency: Currency,
+    expiry: str,
+    client: DeribitJsonRpcClient | None = None,
+) -> dict:
+    """
+    Get open interest aggregated by strike for a specific expiry.
+
+    Returns OI distribution, peak areas, and top strikes.
+
+    Args:
+        currency: BTC or ETH
+        expiry: Expiry label (e.g., "28JUN24")
+
+    Returns:
+        OpenInterestByStrikeResponse with OI analysis
+    """
+    client = client or get_client()
+    notes: list[str] = []
+
+    try:
+        # Get spot price
+        index_result = await client.call_public(
+            "public/get_index_price", {"index_name": f"{currency.lower()}_usd"}
+        )
+        spot = _safe_float(index_result.get("index_price", 0))
+
+        # Get instruments for this expiry
+        instruments_result = await client.call_public(
+            "public/get_instruments",
+            {"currency": currency, "kind": "option", "expired": False},
+        )
+
+        all_options = instruments_result if isinstance(instruments_result, list) else []
+
+        # Filter by expiry
+        expiry_upper = expiry.upper()
+        matching_options = []
+
+        for opt in all_options:
+            inst_name = opt.get("instrument_name", "")
+            parts = inst_name.split("-")
+            if len(parts) >= 3 and parts[1].upper() == expiry_upper:
+                matching_options.append(opt)
+
+        if not matching_options:
+            return ErrorResponse(
+                code=404,
+                message=f"No options found for expiry: {expiry}",
+                notes=[f"currency:{currency}", f"expiry:{expiry}"],
+            ).model_dump()
+
+        # Collect OI for all options
+        option_data_list: list[OptionData] = []
+
+        for opt in matching_options:
+            inst_name = opt.get("instrument_name", "")
+            strike = _safe_float(opt.get("strike"))
+            opt_type = opt.get("option_type", "call")
+
+            try:
+                ticker = await client.call_public(
+                    "public/ticker", {"instrument_name": inst_name}
+                )
+
+                oi = _safe_float(ticker.get("open_interest"))
+
+                if strike and oi:
+                    option_data_list.append(
+                        OptionData(
+                            strike=strike,
+                            option_type=opt_type,
+                            instrument_name=inst_name,
+                            open_interest=oi,
+                        )
+                    )
+            except DeribitError:
+                continue
+
+        # Aggregate OI by strike
+        oi_by_strike = aggregate_oi_by_strike(option_data_list)
+
+        # Calculate totals
+        total_call_oi = sum(s.call_oi for s in oi_by_strike)
+        total_put_oi = sum(s.put_oi for s in oi_by_strike)
+        pcr_total = total_put_oi / total_call_oi if total_call_oi > 0 else None
+
+        # Find top strikes
+        top_strikes_data = find_oi_peaks(oi_by_strike, top_n=5)
+
+        # Find peak range
+        peak_range_tuple = find_oi_peak_range(oi_by_strike, percentile=0.8)
+        peak_range = None
+        if peak_range_tuple:
+            total_oi = sum(s.total_oi for s in oi_by_strike)
+            peak_oi = sum(
+                s.total_oi
+                for s in oi_by_strike
+                if peak_range_tuple[0] <= s.strike <= peak_range_tuple[1]
+            )
+            concentration = peak_oi / total_oi if total_oi > 0 else 0
+            peak_range = OIPeakInfo(
+                low=peak_range_tuple[0],
+                high=peak_range_tuple[1],
+                concentration=round(concentration, 3),
+            )
+
+        # Convert to response format (limit strikes for compact output)
+        # Keep strikes around spot
+        if spot:
+            oi_by_strike.sort(key=lambda x: abs(x.strike - spot))
+            oi_by_strike = oi_by_strike[:50]
+            oi_by_strike.sort(key=lambda x: x.strike)
+
+        strike_data = [
+            StrikeOIData(
+                strike=s.strike,
+                call_oi=round(s.call_oi, 2),
+                put_oi=round(s.put_oi, 2),
+                total_oi=round(s.total_oi, 2),
+                pcr=round(s.put_call_ratio, 3) if s.put_call_ratio else None,
+            )
+            for s in oi_by_strike
+        ]
+
+        top_strikes = [
+            StrikeOIData(
+                strike=s.strike,
+                call_oi=round(s.call_oi, 2),
+                put_oi=round(s.put_oi, 2),
+                total_oi=round(s.total_oi, 2),
+                pcr=round(s.put_call_ratio, 3) if s.put_call_ratio else None,
+            )
+            for s in top_strikes_data
+        ]
+
+        return OpenInterestByStrikeResponse(
+            ccy=currency,
+            expiry=expiry_upper,
+            spot=round(spot, 2) if spot else 0,
+            total_call_oi=round(total_call_oi, 2),
+            total_put_oi=round(total_put_oi, 2),
+            pcr_total=round(pcr_total, 3) if pcr_total else None,
+            oi_by_strike=strike_data,
+            top_strikes=top_strikes,
+            peak_range=peak_range,
+            notes=notes[:6],
+        ).model_dump()
+
+    except DeribitError as e:
+        return ErrorResponse(
+            code=e.code,
+            message=e.message[:100],
+            notes=[f"currency:{currency}", f"expiry:{expiry}"],
+        ).model_dump()
+
+
+# =============================================================================
+# Tool 11: compute_gamma_exposure
+# =============================================================================
+
+
+async def compute_gamma_exposure(
+    currency: Currency,
+    expiries: list[str] | None = None,
+    client: DeribitJsonRpcClient | None = None,
+) -> dict:
+    """
+    Calculate gamma exposure (GEX) profile.
+
+    GEX measures the sensitivity of market makers' delta hedging.
+    - Positive GEX: MMs are long gamma, will buy dips/sell rallies (stabilizing)
+    - Negative GEX: MMs are short gamma, will sell dips/buy rallies (destabilizing)
+
+    Args:
+        currency: BTC or ETH
+        expiries: List of expiry labels (e.g., ["28JUN24", "27DEC24"])
+                  If None, uses nearest 3 expiries
+
+    Returns:
+        GammaExposureResponse with GEX by strike and flip level
+    """
+    client = client or get_client()
+    notes: list[str] = []
+
+    try:
+        # Get spot price
+        index_result = await client.call_public(
+            "public/get_index_price", {"index_name": f"{currency.lower()}_usd"}
+        )
+        spot = _safe_float(index_result.get("index_price", 0))
+
+        if not spot or spot <= 0:
+            return ErrorResponse(
+                code=-1,
+                message="Could not fetch spot price",
+                notes=["spot_unavailable"],
+            ).model_dump()
+
+        # Get instruments
+        instruments_result = await client.call_public(
+            "public/get_instruments",
+            {"currency": currency, "kind": "option", "expired": False},
+        )
+
+        all_options = instruments_result if isinstance(instruments_result, list) else []
+        current_ts = _current_ts_ms()
+
+        # Group by expiry
+        by_expiry: dict[str, list] = {}
+        for opt in all_options:
+            inst_name = opt.get("instrument_name", "")
+            parts = inst_name.split("-")
+            if len(parts) >= 3:
+                exp_label = parts[1].upper()
+                exp_ts = opt.get("expiration_timestamp", 0)
+                if exp_ts > current_ts:
+                    if exp_label not in by_expiry:
+                        by_expiry[exp_label] = []
+                    by_expiry[exp_label].append(opt)
+
+        # Determine which expiries to use
+        if expiries:
+            target_expiries = [e.upper() for e in expiries]
+        else:
+            # Use nearest 3 expiries
+            sorted_expiries = sorted(
+                by_expiry.keys(),
+                key=lambda x: by_expiry[x][0].get("expiration_timestamp", 0),
+            )
+            target_expiries = sorted_expiries[:3]
+
+        notes.append(f"expiries:{len(target_expiries)}")
+
+        # Collect option data with gamma and OI
+        option_data_list: list[OptionData] = []
+        expiries_included = []
+
+        for exp_label in target_expiries:
+            if exp_label not in by_expiry:
+                notes.append(f"missing_expiry:{exp_label}")
+                continue
+
+            expiries_included.append(exp_label)
+
+            for opt in by_expiry[exp_label]:
+                inst_name = opt.get("instrument_name", "")
+                strike = _safe_float(opt.get("strike"))
+                opt_type = opt.get("option_type", "call")
+
+                try:
+                    ticker = await client.call_public(
+                        "public/ticker", {"instrument_name": inst_name}
+                    )
+
+                    greeks = ticker.get("greeks", {})
+                    gamma = _safe_float(greeks.get("gamma"))
+                    oi = _safe_float(ticker.get("open_interest"))
+
+                    if strike and gamma is not None and oi:
+                        option_data_list.append(
+                            OptionData(
+                                strike=strike,
+                                option_type=opt_type,
+                                instrument_name=inst_name,
+                                gamma=gamma,
+                                open_interest=oi,
+                            )
+                        )
+                except DeribitError:
+                    continue
+
+        if not option_data_list:
+            return ErrorResponse(
+                code=-1,
+                message="No valid gamma/OI data found",
+                notes=[f"currency:{currency}"],
+            ).model_dump()
+
+        # Calculate GEX profile
+        gex_profile = calculate_gamma_exposure_profile(option_data_list, spot)
+
+        # Scale GEX to millions for readability
+        scale = 1_000_000
+
+        # Get top positive and negative GEX strikes
+        sorted_positive = sorted(
+            [g for g in gex_profile.gex_by_strike if g.net_gex > 0],
+            key=lambda x: x.net_gex,
+            reverse=True,
+        )[:3]
+
+        sorted_negative = sorted(
+            [g for g in gex_profile.gex_by_strike if g.net_gex < 0],
+            key=lambda x: x.net_gex,
+        )[:3]
+
+        # Filter strikes around spot for compact output
+        gex_by_strike = gex_profile.gex_by_strike
+        gex_by_strike.sort(key=lambda x: abs(x.strike - spot))
+        gex_by_strike = gex_by_strike[:50]
+        gex_by_strike.sort(key=lambda x: x.strike)
+
+        # Convert to response format
+        gex_data = [
+            StrikeGEX(
+                strike=g.strike,
+                call_gex=round(g.call_gex / scale, 3),
+                put_gex=round(g.put_gex / scale, 3),
+                net_gex=round(g.net_gex / scale, 3),
+            )
+            for g in gex_by_strike
+        ]
+
+        top_positive = [
+            StrikeGEX(
+                strike=g.strike,
+                call_gex=round(g.call_gex / scale, 3),
+                put_gex=round(g.put_gex / scale, 3),
+                net_gex=round(g.net_gex / scale, 3),
+            )
+            for g in sorted_positive
+        ]
+
+        top_negative = [
+            StrikeGEX(
+                strike=g.strike,
+                call_gex=round(g.call_gex / scale, 3),
+                put_gex=round(g.put_gex / scale, 3),
+                net_gex=round(g.net_gex / scale, 3),
+            )
+            for g in sorted_negative
+        ]
+
+        # Determine MM positioning
+        net_gex_scaled = gex_profile.net_gex / scale
+        if net_gex_scaled > 0.5:
+            mm_positioning = "long_gamma"
+        elif net_gex_scaled < -0.5:
+            mm_positioning = "short_gamma"
+        else:
+            mm_positioning = "neutral"
+
+        return GammaExposureResponse(
+            ccy=currency,
+            spot=round(spot, 2),
+            expiries_included=expiries_included,
+            net_gex=round(net_gex_scaled, 3),
+            gamma_flip=round(gex_profile.gamma_flip_level, 2) if gex_profile.gamma_flip_level else None,
+            max_pos_gex_strike=gex_profile.max_positive_gex_strike,
+            max_neg_gex_strike=gex_profile.max_negative_gex_strike,
+            gex_by_strike=gex_data,
+            top_positive=top_positive,
+            top_negative=top_negative,
+            market_maker_positioning=mm_positioning,
+            notes=notes[:6] + gex_profile.calculation_notes,
+        ).model_dump()
+
+    except DeribitError as e:
+        return ErrorResponse(
+            code=e.code,
+            message=e.message[:100],
+            notes=[f"currency:{currency}"],
+        ).model_dump()
+
+
+# =============================================================================
+# Tool 12: compute_max_pain
+# =============================================================================
+
+
+async def compute_max_pain(
+    currency: Currency,
+    expiry: str,
+    client: DeribitJsonRpcClient | None = None,
+) -> dict:
+    """
+    Calculate max pain strike for a specific expiry.
+
+    Max pain is the strike price where option buyers (long calls + long puts)
+    would experience maximum loss, i.e., where most options expire worthless.
+
+    Theory: Price tends to gravitate toward max pain at expiry.
+
+    Args:
+        currency: BTC or ETH
+        expiry: Expiry label (e.g., "28JUN24")
+
+    Returns:
+        MaxPainResponse with max pain strike and pain curve
+    """
+    client = client or get_client()
+    notes: list[str] = []
+
+    try:
+        # Get spot price
+        index_result = await client.call_public(
+            "public/get_index_price", {"index_name": f"{currency.lower()}_usd"}
+        )
+        spot = _safe_float(index_result.get("index_price", 0))
+
+        if not spot or spot <= 0:
+            return ErrorResponse(
+                code=-1,
+                message="Could not fetch spot price",
+                notes=["spot_unavailable"],
+            ).model_dump()
+
+        # Get instruments for this expiry
+        instruments_result = await client.call_public(
+            "public/get_instruments",
+            {"currency": currency, "kind": "option", "expired": False},
+        )
+
+        all_options = instruments_result if isinstance(instruments_result, list) else []
+
+        # Filter by expiry
+        expiry_upper = expiry.upper()
+        matching_options = []
+        expiry_ts = 0
+
+        for opt in all_options:
+            inst_name = opt.get("instrument_name", "")
+            parts = inst_name.split("-")
+            if len(parts) >= 3 and parts[1].upper() == expiry_upper:
+                matching_options.append(opt)
+                if expiry_ts == 0:
+                    expiry_ts = opt.get("expiration_timestamp", 0)
+
+        if not matching_options:
+            return ErrorResponse(
+                code=404,
+                message=f"No options found for expiry: {expiry}",
+                notes=[f"currency:{currency}", f"expiry:{expiry}"],
+            ).model_dump()
+
+        # Collect OI for all options
+        option_data_list: list[OptionData] = []
+
+        for opt in matching_options:
+            inst_name = opt.get("instrument_name", "")
+            strike = _safe_float(opt.get("strike"))
+            opt_type = opt.get("option_type", "call")
+
+            try:
+                ticker = await client.call_public(
+                    "public/ticker", {"instrument_name": inst_name}
+                )
+
+                oi = _safe_float(ticker.get("open_interest"))
+
+                if strike and oi:
+                    option_data_list.append(
+                        OptionData(
+                            strike=strike,
+                            option_type=opt_type,
+                            instrument_name=inst_name,
+                            open_interest=oi,
+                        )
+                    )
+            except DeribitError:
+                continue
+
+        if not option_data_list:
+            return ErrorResponse(
+                code=-1,
+                message="No valid OI data found",
+                notes=[f"currency:{currency}", f"expiry:{expiry}"],
+            ).model_dump()
+
+        # Calculate max pain
+        max_pain_result = calculate_max_pain(option_data_list, spot)
+
+        # Calculate distance from spot
+        distance_pct = ((max_pain_result.max_pain_strike - spot) / spot) * 100
+
+        # Convert pain curve to response format
+        pain_curve_top3 = [
+            PainCurvePoint(strike=p[0], pain=round(p[1], 2))
+            for p in max_pain_result.pain_curve_top3
+        ]
+
+        # PCR
+        pcr = (
+            max_pain_result.total_put_oi / max_pain_result.total_call_oi
+            if max_pain_result.total_call_oi > 0
+            else None
+        )
+
+        return MaxPainResponse(
+            ccy=currency,
+            expiry=expiry_upper,
+            expiry_ts=expiry_ts,
+            spot=round(spot, 2),
+            max_pain_strike=max_pain_result.max_pain_strike,
+            distance_from_spot_pct=round(distance_pct, 2),
+            pain_curve_top3=pain_curve_top3,
+            total_call_oi=round(max_pain_result.total_call_oi, 2),
+            total_put_oi=round(max_pain_result.total_put_oi, 2),
+            pcr=round(pcr, 3) if pcr else None,
+            notes=notes[:6],
+        ).model_dump()
+
+    except DeribitError as e:
+        return ErrorResponse(
+            code=e.code,
+            message=e.message[:100],
+            notes=[f"currency:{currency}", f"expiry:{expiry}"],
+        ).model_dump()
+
+
+# =============================================================================
+# Tool 13: get_iv_term_structure
+# =============================================================================
+
+
+async def get_iv_term_structure(
+    currency: Currency,
+    tenors_days: list[int] | None = None,
+    client: DeribitJsonRpcClient | None = None,
+) -> dict:
+    """
+    Get ATM IV term structure across tenors.
+
+    Returns IV at each tenor, term structure slope, and shape analysis.
+
+    Args:
+        currency: BTC or ETH
+        tenors_days: Target tenors in days (default: [7, 14, 30, 60, 90])
+
+    Returns:
+        IVTermStructureResponse with term structure data
+    """
+    client = client or get_client()
+    notes: list[str] = []
+    tenors_days = tenors_days or [7, 14, 30, 60, 90]
+
+    try:
+        # Get spot price
+        index_result = await client.call_public(
+            "public/get_index_price", {"index_name": f"{currency.lower()}_usd"}
+        )
+        spot = _safe_float(index_result.get("index_price", 0))
+
+        if not spot or spot <= 0:
+            return ErrorResponse(
+                code=-1,
+                message="Could not fetch spot price",
+                notes=["spot_unavailable"],
+            ).model_dump()
+
+        # Get DVOL if available
+        dvol_current = None
+        try:
+            dvol_result = await dvol_snapshot(currency, client)
+            if not dvol_result.get("error") and dvol_result.get("dvol", 0) > 0:
+                dvol_current = dvol_result.get("dvol")
+        except Exception:
+            pass
+
+        # Get instruments
+        instruments_result = await client.call_public(
+            "public/get_instruments",
+            {"currency": currency, "kind": "option", "expired": False},
+        )
+
+        all_options = instruments_result if isinstance(instruments_result, list) else []
+        current_ts = _current_ts_ms()
+
+        # Group by expiration
+        by_expiry: dict[int, list] = {}
+        for opt in all_options:
+            exp = opt.get("expiration_timestamp", 0)
+            if exp <= current_ts:
+                continue
+            if exp not in by_expiry:
+                by_expiry[exp] = []
+            by_expiry[exp].append(opt)
+
+        # For each target tenor, find closest expiry and ATM IV
+        term_structure_points: list[TSPoint] = []
+
+        for target_days in tenors_days[:6]:  # Limit to 6 tenors
+            # Find closest expiration
+            best_exp = None
+            best_distance = float("inf")
+
+            for exp_ts in by_expiry:
+                days = days_to_expiry_from_ts(exp_ts, current_ts)
+                distance = abs(days - target_days)
+                if distance < best_distance and distance < target_days * 0.5:
+                    best_distance = distance
+                    best_exp = exp_ts
+
+            if best_exp is None:
+                continue
+
+            actual_days = days_to_expiry_from_ts(best_exp, current_ts)
+            expiry_options = by_expiry[best_exp]
+
+            # Find ATM strike
+            atm_strike = None
+            min_dist = float("inf")
+            for opt in expiry_options:
+                strike = _safe_float(opt.get("strike"))
+                if strike:
+                    dist = abs(strike - spot)
+                    if dist < min_dist:
+                        min_dist = dist
+                        atm_strike = strike
+
+            if not atm_strike:
+                continue
+
+            # Get ATM IV
+            atm_iv = None
+            atm_call_name = f"{currency}-{_format_expiry(best_exp)}-{int(atm_strike)}-C"
+            try:
+                atm_ticker = await client.call_public(
+                    "public/ticker", {"instrument_name": atm_call_name}
+                )
+                iv = _safe_float(atm_ticker.get("mark_iv"))
+                if iv and iv > 1:
+                    iv = iv / 100
+                atm_iv = iv
+            except DeribitError:
+                notes.append(f"atm_ticker_failed:{target_days}d")
+                continue
+
+            term_structure_points.append(
+                TSPoint(
+                    days=int(actual_days),
+                    atm_iv=atm_iv,
+                    expiry_label=_format_expiry(best_exp),
+                    expiry_ts=best_exp,
+                )
+            )
+
+        # Calculate slopes
+        slope_short = calculate_iv_term_structure_slope(term_structure_points, 7, 30)
+        slope_long = calculate_iv_term_structure_slope(term_structure_points, 30, 90)
+
+        # Determine shape
+        is_contango = analyze_term_structure_shape(term_structure_points)
+        if is_contango:
+            shape = "contango"
+        else:
+            # Check if relatively flat
+            if len(term_structure_points) >= 2:
+                ivs = [p.atm_iv for p in term_structure_points if p.atm_iv]
+                if ivs and max(ivs) - min(ivs) < 0.02:
+                    shape = "flat"
+                else:
+                    shape = "backwardation"
+            else:
+                shape = "flat"
+
+        # Convert to response format
+        ts_data = [
+            TermStructurePoint(
+                days=p.days,
+                expiry=p.expiry_label,
+                atm_iv=round(p.atm_iv, 4) if p.atm_iv else None,
+                atm_iv_pct=round(p.atm_iv * 100, 2) if p.atm_iv else None,
+            )
+            for p in term_structure_points
+        ]
+
+        # Sort by days
+        ts_data.sort(key=lambda x: x.days)
+
+        return IVTermStructureResponse(
+            ccy=currency,
+            spot=round(spot, 2),
+            term_structure=ts_data,
+            slope_7d_30d=round(slope_short * 100, 4) if slope_short else None,  # Convert to %
+            slope_30d_90d=round(slope_long * 100, 4) if slope_long else None,
+            shape=shape,
+            dvol_current=dvol_current,
+            notes=notes[:6],
+        ).model_dump()
+
+    except DeribitError as e:
+        return ErrorResponse(
+            code=e.code,
+            message=e.message[:100],
+            notes=[f"currency:{currency}"],
+        ).model_dump()
+
+
+# =============================================================================
+# Tool 14: get_skew_metrics
+# =============================================================================
+
+
+async def get_skew_metrics(
+    currency: Currency,
+    tenors_days: list[int] | None = None,
+    client: DeribitJsonRpcClient | None = None,
+) -> dict:
+    """
+    Get volatility skew metrics (RR25d, BF25d) across tenors.
+
+    Risk Reversal (RR25d): Call_IV(25d) - Put_IV(25d)
+        - Positive: Bullish skew (upside demand)
+        - Negative: Bearish skew (downside protection)
+
+    Butterfly (BF25d): (Call_IV + Put_IV) / 2 - ATM_IV
+        - Positive: Fat tails pricing (wing demand)
+
+    Args:
+        currency: BTC or ETH
+        tenors_days: Target tenors in days (default: [7, 30])
+
+    Returns:
+        SkewMetricsResponse with skew by tenor and trend
+    """
+    client = client or get_client()
+    notes: list[str] = []
+    tenors_days = tenors_days or [7, 30]
+
+    try:
+        # Get spot price
+        index_result = await client.call_public(
+            "public/get_index_price", {"index_name": f"{currency.lower()}_usd"}
+        )
+        spot = _safe_float(index_result.get("index_price", 0))
+
+        if not spot or spot <= 0:
+            return ErrorResponse(
+                code=-1,
+                message="Could not fetch spot price",
+                notes=["spot_unavailable"],
+            ).model_dump()
+
+        # Get instruments
+        instruments_result = await client.call_public(
+            "public/get_instruments",
+            {"currency": currency, "kind": "option", "expired": False},
+        )
+
+        all_options = instruments_result if isinstance(instruments_result, list) else []
+        current_ts = _current_ts_ms()
+
+        # Group by expiration
+        by_expiry: dict[int, list] = {}
+        for opt in all_options:
+            exp = opt.get("expiration_timestamp", 0)
+            if exp <= current_ts:
+                continue
+            if exp not in by_expiry:
+                by_expiry[exp] = []
+            by_expiry[exp].append(opt)
+
+        # For each target tenor, calculate skew metrics
+        skew_metrics_list: list[SkewMetrics] = []
+        skew_by_tenor: list[TenorSkew] = []
+
+        for target_days in tenors_days[:6]:  # Limit to 6 tenors
+            # Find closest expiration
+            best_exp = None
+            best_distance = float("inf")
+
+            for exp_ts in by_expiry:
+                days = days_to_expiry_from_ts(exp_ts, current_ts)
+                distance = abs(days - target_days)
+                if distance < best_distance and distance < target_days * 0.5:
+                    best_distance = distance
+                    best_exp = exp_ts
+
+            if best_exp is None:
+                continue
+
+            actual_days = days_to_expiry_from_ts(best_exp, current_ts)
+            expiry_label = _format_expiry(best_exp)
+            expiry_options = by_expiry[best_exp]
+
+            # Find ATM strike and IV
+            atm_strike = None
+            min_dist = float("inf")
+            for opt in expiry_options:
+                strike = _safe_float(opt.get("strike"))
+                if strike:
+                    dist = abs(strike - spot)
+                    if dist < min_dist:
+                        min_dist = dist
+                        atm_strike = strike
+
+            if not atm_strike:
+                continue
+
+            atm_iv = None
+            atm_call_name = f"{currency}-{expiry_label}-{int(atm_strike)}-C"
+            try:
+                atm_ticker = await client.call_public(
+                    "public/ticker", {"instrument_name": atm_call_name}
+                )
+                iv = _safe_float(atm_ticker.get("mark_iv"))
+                if iv and iv > 1:
+                    iv = iv / 100
+                atm_iv = iv
+            except DeribitError:
+                continue
+
+            if not atm_iv:
+                continue
+
+            # Estimate 25d strikes
+            call_25d_strike = estimate_25d_strike(spot, atm_iv, actual_days, is_call=True)
+            put_25d_strike = estimate_25d_strike(spot, atm_iv, actual_days, is_call=False)
+
+            # Round to nearest available strike
+            available_strikes = sorted(
+                {opt.get("strike") for opt in expiry_options if opt.get("strike")}
+            )
+
+            def find_nearest_strike(target: float, strikes: list[float]) -> float | None:
+                if not strikes:
+                    return None
+                return min(strikes, key=lambda x: abs(x - target))
+
+            call_25d_strike = find_nearest_strike(call_25d_strike, available_strikes)
+            put_25d_strike = find_nearest_strike(put_25d_strike, available_strikes)
+
+            # Get 25d IVs
+            call_25d_iv = None
+            put_25d_iv = None
+
+            if call_25d_strike:
+                call_25d_name = f"{currency}-{expiry_label}-{int(call_25d_strike)}-C"
+                try:
+                    ticker = await client.call_public(
+                        "public/ticker", {"instrument_name": call_25d_name}
+                    )
+                    iv = _safe_float(ticker.get("mark_iv"))
+                    if iv and iv > 1:
+                        iv = iv / 100
+                    call_25d_iv = iv
+                except DeribitError:
+                    pass
+
+            if put_25d_strike:
+                put_25d_name = f"{currency}-{expiry_label}-{int(put_25d_strike)}-P"
+                try:
+                    ticker = await client.call_public(
+                        "public/ticker", {"instrument_name": put_25d_name}
+                    )
+                    iv = _safe_float(ticker.get("mark_iv"))
+                    if iv and iv > 1:
+                        iv = iv / 100
+                    put_25d_iv = iv
+                except DeribitError:
+                    pass
+
+            # Calculate RR and BF
+            rr25d = calculate_risk_reversal(call_25d_iv, put_25d_iv)
+            bf25d = calculate_butterfly(call_25d_iv, put_25d_iv, atm_iv)
+            skew_dir = determine_skew_direction(rr25d)
+
+            skew_metrics_list.append(
+                SkewMetrics(
+                    days=int(actual_days),
+                    rr25d=rr25d,
+                    bf25d=bf25d,
+                    atm_iv=atm_iv,
+                    call_25d_iv=call_25d_iv,
+                    put_25d_iv=put_25d_iv,
+                    skew_direction=skew_dir,
+                )
+            )
+
+            skew_by_tenor.append(
+                TenorSkew(
+                    days=int(actual_days),
+                    expiry=expiry_label,
+                    atm_iv=round(atm_iv, 4) if atm_iv else None,
+                    rr25d=round(rr25d, 4) if rr25d else None,
+                    rr25d_pct=round(rr25d * 100, 2) if rr25d else None,
+                    bf25d=round(bf25d, 4) if bf25d else None,
+                    bf25d_pct=round(bf25d * 100, 2) if bf25d else None,
+                    skew_dir=skew_dir,
+                )
+            )
+
+        # Determine skew trend
+        skew_trend = determine_skew_trend(skew_metrics_list)
+
+        # Sort by days
+        skew_by_tenor.sort(key=lambda x: x.days)
+
+        # Calculate summary
+        valid_rr = [m.rr25d for m in skew_metrics_list if m.rr25d is not None]
+        valid_bf = [m.bf25d for m in skew_metrics_list if m.bf25d is not None]
+
+        avg_rr = sum(valid_rr) / len(valid_rr) if valid_rr else None
+        avg_bf = sum(valid_bf) / len(valid_bf) if valid_bf else None
+
+        # Determine dominant direction
+        directions = [m.skew_direction for m in skew_metrics_list if m.skew_direction]
+        if directions:
+            bullish_count = directions.count("bullish")
+            bearish_count = directions.count("bearish")
+            if bullish_count > bearish_count:
+                dominant = "bullish"
+            elif bearish_count > bullish_count:
+                dominant = "bearish"
+            else:
+                dominant = "neutral"
+        else:
+            dominant = None
+
+        summary = {
+            "avg_rr25d_pct": round(avg_rr * 100, 2) if avg_rr else None,
+            "avg_bf25d_pct": round(avg_bf * 100, 2) if avg_bf else None,
+            "dominant_direction": dominant,
+            "tenors_analyzed": len(skew_by_tenor),
+        }
+
+        return SkewMetricsResponse(
+            ccy=currency,
+            spot=round(spot, 2),
+            skew_by_tenor=skew_by_tenor,
+            skew_trend=skew_trend,
+            summary=summary,
+            notes=notes[:6],
+        ).model_dump()
+
+    except DeribitError as e:
+        return ErrorResponse(
+            code=e.code,
+            message=e.message[:100],
+            notes=[f"currency:{currency}"],
         ).model_dump()
 
 

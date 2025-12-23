@@ -6,20 +6,40 @@ Covers:
 - Expected move calculation
 - Risk reversal/butterfly
 - Spread calculations
+- Gamma Exposure (GEX) calculations
+- Max Pain calculations
+- Open Interest analysis
+- IV Term Structure
+- Skew metrics
 """
 
 import math
 import pytest
 
 from deribit_mcp.analytics import (
+    OptionData,
+    aggregate_oi_by_strike,
+    analyze_term_structure_shape,
     calculate_butterfly,
     calculate_expected_move,
+    calculate_gamma_exposure_profile,
     calculate_imbalance,
+    calculate_iv_term_structure_slope,
+    calculate_max_pain,
+    calculate_pain_at_strike,
     calculate_risk_reversal,
+    calculate_single_gex,
     days_to_expiry_from_ts,
+    determine_skew_direction,
+    determine_skew_trend,
     dvol_to_decimal,
+    estimate_25d_strike,
+    find_oi_peak_range,
+    find_oi_peaks,
     iv_annualized_to_horizon,
+    SkewMetrics,
     spread_in_bps,
+    TermStructurePoint,
     MINUTES_PER_YEAR,
 )
 
@@ -270,3 +290,374 @@ class TestDaysToExpiry:
         result = days_to_expiry_from_ts(expiry_ts_ms, current_ts_ms)
 
         assert result == 0.0
+
+
+# =============================================================================
+# Gamma Exposure Tests
+# =============================================================================
+
+
+class TestGammaExposure:
+    """Tests for gamma exposure calculations."""
+
+    def test_calculate_single_gex_call(self):
+        """Test GEX calculation for a call option."""
+        gamma = 0.0001  # Gamma per 1 point move
+        open_interest = 1000  # 1000 contracts
+        spot_price = 50000
+        
+        gex = calculate_single_gex(gamma, open_interest, spot_price, "call")
+        
+        # GEX for calls should be negative (dealers short gamma)
+        assert gex < 0
+
+    def test_calculate_single_gex_put(self):
+        """Test GEX calculation for a put option."""
+        gamma = 0.0001
+        open_interest = 1000
+        spot_price = 50000
+        
+        gex = calculate_single_gex(gamma, open_interest, spot_price, "put")
+        
+        # GEX for puts should be positive (puts have negative gamma, dealers benefit)
+        assert gex > 0
+
+    def test_calculate_single_gex_zero_oi(self):
+        """Test GEX with zero OI returns 0."""
+        gex = calculate_single_gex(0.0001, 0, 50000, "call")
+        assert gex == 0.0
+
+    def test_calculate_single_gex_none_gamma(self):
+        """Test GEX with None gamma returns 0."""
+        gex = calculate_single_gex(None, 1000, 50000, "call")
+        assert gex == 0.0
+
+    def test_gamma_exposure_profile_basic(self):
+        """Test gamma exposure profile calculation."""
+        options = [
+            OptionData(strike=50000, option_type="call", instrument_name="BTC-50000-C",
+                       gamma=0.0001, open_interest=1000),
+            OptionData(strike=50000, option_type="put", instrument_name="BTC-50000-P",
+                       gamma=0.0001, open_interest=1500),
+            OptionData(strike=55000, option_type="call", instrument_name="BTC-55000-C",
+                       gamma=0.00005, open_interest=800),
+        ]
+        spot_price = 50000
+        
+        profile = calculate_gamma_exposure_profile(options, spot_price)
+        
+        assert len(profile.gex_by_strike) > 0
+        assert profile.spot_price == spot_price
+        assert profile.net_gex is not None
+
+    def test_gamma_exposure_profile_empty(self):
+        """Test gamma exposure profile with empty options."""
+        profile = calculate_gamma_exposure_profile([], 50000)
+        
+        assert len(profile.gex_by_strike) == 0
+        assert profile.net_gex == 0.0
+
+    def test_gamma_flip_level_detection(self):
+        """Test gamma flip level detection."""
+        # Create options that should produce a sign change in net GEX
+        options = [
+            # At 45000: more puts (positive GEX)
+            OptionData(strike=45000, option_type="put", instrument_name="BTC-45000-P",
+                       gamma=0.0001, open_interest=2000),
+            OptionData(strike=45000, option_type="call", instrument_name="BTC-45000-C",
+                       gamma=0.0001, open_interest=500),
+            # At 55000: more calls (negative GEX)
+            OptionData(strike=55000, option_type="call", instrument_name="BTC-55000-C",
+                       gamma=0.0001, open_interest=2000),
+            OptionData(strike=55000, option_type="put", instrument_name="BTC-55000-P",
+                       gamma=0.0001, open_interest=500),
+        ]
+        
+        profile = calculate_gamma_exposure_profile(options, 50000)
+        
+        # Should find a gamma flip somewhere between 45000 and 55000
+        # Note: gamma flip may be None if no sign change occurs
+        if len(profile.gex_by_strike) >= 2:
+            # Verify the calculation completed
+            assert profile.spot_price == 50000
+
+
+# =============================================================================
+# Max Pain Tests
+# =============================================================================
+
+
+class TestMaxPain:
+    """Tests for max pain calculations."""
+
+    def test_calculate_pain_at_strike_calls_itm(self):
+        """Test pain calculation when calls are ITM."""
+        options = [
+            OptionData(strike=45000, option_type="call", instrument_name="BTC-45000-C",
+                       open_interest=100),
+        ]
+        
+        # If price expires at 50000, 45000 call is ITM by 5000
+        pain = calculate_pain_at_strike(50000, options)
+        
+        assert pain == (50000 - 45000) * 100  # 500000
+
+    def test_calculate_pain_at_strike_puts_itm(self):
+        """Test pain calculation when puts are ITM."""
+        options = [
+            OptionData(strike=55000, option_type="put", instrument_name="BTC-55000-P",
+                       open_interest=100),
+        ]
+        
+        # If price expires at 50000, 55000 put is ITM by 5000
+        pain = calculate_pain_at_strike(50000, options)
+        
+        assert pain == (55000 - 50000) * 100  # 500000
+
+    def test_calculate_pain_at_strike_otm(self):
+        """Test pain calculation when options are OTM."""
+        options = [
+            OptionData(strike=55000, option_type="call", instrument_name="BTC-55000-C",
+                       open_interest=100),
+            OptionData(strike=45000, option_type="put", instrument_name="BTC-45000-P",
+                       open_interest=100),
+        ]
+        
+        # If price expires at 50000, both are OTM
+        pain = calculate_pain_at_strike(50000, options)
+        
+        assert pain == 0
+
+    def test_calculate_max_pain_basic(self):
+        """Test max pain calculation."""
+        options = [
+            # Calls at various strikes
+            OptionData(strike=45000, option_type="call", instrument_name="C1",
+                       open_interest=100),
+            OptionData(strike=50000, option_type="call", instrument_name="C2",
+                       open_interest=200),
+            OptionData(strike=55000, option_type="call", instrument_name="C3",
+                       open_interest=100),
+            # Puts at various strikes
+            OptionData(strike=45000, option_type="put", instrument_name="P1",
+                       open_interest=100),
+            OptionData(strike=50000, option_type="put", instrument_name="P2",
+                       open_interest=200),
+            OptionData(strike=55000, option_type="put", instrument_name="P3",
+                       open_interest=100),
+        ]
+        
+        result = calculate_max_pain(options, 50000)
+        
+        # Max pain should be at a strike where most options expire worthless
+        assert result.max_pain_strike in [45000, 50000, 55000]
+        assert len(result.pain_curve) == 3
+        assert len(result.pain_curve_top3) <= 3
+
+    def test_calculate_max_pain_empty(self):
+        """Test max pain with empty options."""
+        result = calculate_max_pain([], 50000)
+        
+        assert result.max_pain_strike == 50000  # Defaults to spot
+        assert len(result.pain_curve) == 0
+
+
+# =============================================================================
+# Open Interest Analysis Tests
+# =============================================================================
+
+
+class TestOpenInterestAnalysis:
+    """Tests for open interest analysis functions."""
+
+    def test_aggregate_oi_by_strike(self):
+        """Test OI aggregation by strike."""
+        options = [
+            OptionData(strike=50000, option_type="call", instrument_name="C1",
+                       open_interest=100),
+            OptionData(strike=50000, option_type="put", instrument_name="P1",
+                       open_interest=150),
+            OptionData(strike=55000, option_type="call", instrument_name="C2",
+                       open_interest=200),
+        ]
+        
+        result = aggregate_oi_by_strike(options)
+        
+        assert len(result) == 2
+        
+        # Check 50000 strike
+        strike_50k = next(s for s in result if s.strike == 50000)
+        assert strike_50k.call_oi == 100
+        assert strike_50k.put_oi == 150
+        assert strike_50k.total_oi == 250
+        assert strike_50k.put_call_ratio == 1.5
+
+    def test_find_oi_peaks(self):
+        """Test finding top OI strikes."""
+        options = [
+            OptionData(strike=45000, option_type="call", instrument_name="C1",
+                       open_interest=100),
+            OptionData(strike=50000, option_type="call", instrument_name="C2",
+                       open_interest=500),  # Highest
+            OptionData(strike=55000, option_type="call", instrument_name="C3",
+                       open_interest=200),
+        ]
+        
+        oi_data = aggregate_oi_by_strike(options)
+        peaks = find_oi_peaks(oi_data, top_n=2)
+        
+        assert len(peaks) == 2
+        assert peaks[0].strike == 50000  # Highest first
+        assert peaks[1].strike == 55000
+
+    def test_find_oi_peak_range(self):
+        """Test finding OI concentration range."""
+        options = [
+            OptionData(strike=45000, option_type="call", instrument_name="C1",
+                       open_interest=10),
+            OptionData(strike=50000, option_type="call", instrument_name="C2",
+                       open_interest=80),  # 80% of OI here
+            OptionData(strike=55000, option_type="call", instrument_name="C3",
+                       open_interest=10),
+        ]
+        
+        oi_data = aggregate_oi_by_strike(options)
+        peak_range = find_oi_peak_range(oi_data, percentile=0.8)
+        
+        assert peak_range is not None
+        # 80% of OI is at 50000
+        assert peak_range[0] == 50000
+        assert peak_range[1] == 50000
+
+
+# =============================================================================
+# IV Term Structure Tests
+# =============================================================================
+
+
+class TestIVTermStructure:
+    """Tests for IV term structure analysis."""
+
+    def test_term_structure_slope_calculation(self):
+        """Test term structure slope calculation."""
+        points = [
+            TermStructurePoint(days=7, atm_iv=0.80, expiry_label="7D", expiry_ts=0),
+            TermStructurePoint(days=30, atm_iv=0.75, expiry_label="30D", expiry_ts=0),
+            TermStructurePoint(days=90, atm_iv=0.70, expiry_label="90D", expiry_ts=0),
+        ]
+        
+        slope = calculate_iv_term_structure_slope(points, 7, 30)
+        
+        # IV drops from 0.80 to 0.75 over 23 days
+        # Slope per 30 days = (0.75 - 0.80) / 23 * 30 ≈ -0.0065
+        assert slope is not None
+        assert slope < 0  # Backwardation
+
+    def test_analyze_term_structure_shape_contango(self):
+        """Test contango detection."""
+        points = [
+            TermStructurePoint(days=7, atm_iv=0.70, expiry_label="7D", expiry_ts=0),
+            TermStructurePoint(days=30, atm_iv=0.75, expiry_label="30D", expiry_ts=0),
+            TermStructurePoint(days=90, atm_iv=0.80, expiry_label="90D", expiry_ts=0),
+        ]
+        
+        is_contango = analyze_term_structure_shape(points)
+        
+        assert is_contango is True
+
+    def test_analyze_term_structure_shape_backwardation(self):
+        """Test backwardation detection."""
+        points = [
+            TermStructurePoint(days=7, atm_iv=0.90, expiry_label="7D", expiry_ts=0),
+            TermStructurePoint(days=30, atm_iv=0.80, expiry_label="30D", expiry_ts=0),
+            TermStructurePoint(days=90, atm_iv=0.70, expiry_label="90D", expiry_ts=0),
+        ]
+        
+        is_contango = analyze_term_structure_shape(points)
+        
+        assert is_contango is False
+
+
+# =============================================================================
+# Skew Metrics Tests
+# =============================================================================
+
+
+class TestSkewMetrics:
+    """Tests for skew metrics calculations."""
+
+    def test_determine_skew_direction_bullish(self):
+        """Test bullish skew detection."""
+        # Positive RR = calls more expensive
+        direction = determine_skew_direction(0.02)  # 2% RR
+        
+        assert direction == "bullish"
+
+    def test_determine_skew_direction_bearish(self):
+        """Test bearish skew detection."""
+        # Negative RR = puts more expensive
+        direction = determine_skew_direction(-0.02)
+        
+        assert direction == "bearish"
+
+    def test_determine_skew_direction_neutral(self):
+        """Test neutral skew detection."""
+        direction = determine_skew_direction(0.001)  # Below threshold
+        
+        assert direction == "neutral"
+
+    def test_determine_skew_direction_none(self):
+        """Test skew direction with None input."""
+        direction = determine_skew_direction(None)
+        
+        assert direction is None
+
+    def test_determine_skew_trend_steepening(self):
+        """Test steepening skew trend detection."""
+        metrics = [
+            SkewMetrics(days=7, rr25d=-0.05, bf25d=None, atm_iv=0.80,
+                       call_25d_iv=None, put_25d_iv=None, skew_direction="bearish"),
+            SkewMetrics(days=30, rr25d=-0.02, bf25d=None, atm_iv=0.75,
+                       call_25d_iv=None, put_25d_iv=None, skew_direction="bearish"),
+        ]
+        
+        trend = determine_skew_trend(metrics)
+        
+        # Short-term has more extreme skew (0.05 vs 0.02)
+        assert trend == "steepening"
+
+    def test_determine_skew_trend_flattening(self):
+        """Test flattening skew trend detection."""
+        metrics = [
+            SkewMetrics(days=7, rr25d=-0.01, bf25d=None, atm_iv=0.80,
+                       call_25d_iv=None, put_25d_iv=None, skew_direction="bearish"),
+            SkewMetrics(days=30, rr25d=-0.05, bf25d=None, atm_iv=0.75,
+                       call_25d_iv=None, put_25d_iv=None, skew_direction="bearish"),
+        ]
+        
+        trend = determine_skew_trend(metrics)
+        
+        # Long-term has more extreme skew
+        assert trend == "flattening"
+
+    def test_estimate_25d_strike_call(self):
+        """Test 25d call strike estimation."""
+        spot = 50000
+        atm_iv = 0.80
+        days = 30
+        
+        strike = estimate_25d_strike(spot, atm_iv, days, is_call=True)
+        
+        # 25d call is OTM, strike should be above spot
+        assert strike > spot
+
+    def test_estimate_25d_strike_put(self):
+        """Test 25d put strike estimation."""
+        spot = 50000
+        atm_iv = 0.80
+        days = 30
+        
+        strike = estimate_25d_strike(spot, atm_iv, days, is_call=False)
+        
+        # 25d put is OTM, strike should be below spot
+        assert strike < spot

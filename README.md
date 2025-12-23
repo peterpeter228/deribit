@@ -1,17 +1,27 @@
-# Deribit MCP Server
+# Deribit Options Analytics MCP Server
 
-🚀 **LLM-友好的 Deribit 衍生品数据 MCP Server**
+🚀 **为 BTC/ETH 期权提供"可交易决策级"聚合指标的 MCP Server**
 
-专为交易系统设计，提供高质量、低 token 消耗的期权/波动率/资金费率/市场快照数据。
+专为量化交易系统设计，提供高质量、低 token 消耗的期权分析数据，支持上层策略在 SWING/SCALP 模式间自动切换。
 
 ## ✨ 特性
 
-- **极简输出**：每个 tool 返回 ≤2KB 紧凑 JSON（硬目标 5KB）
-- **智能缓存**：双层 TTL 缓存（快速 1s / 慢速 30s）
-- **限速保护**：Token Bucket 限速器，避免触发 API 限制
-- **错误降级**：优雅处理超时/错误，返回可用的部分数据
-- **安全优先**：密钥环境变量读取，自动日志脱敏
-- **双模式部署**：支持 stdio（本地）和 HTTP/SSE（远程）
+### 核心分析能力
+
+- **期权链分析** (`get_option_chain`): 完整期权链数据，含 Greeks、OI、Volume
+- **OI 分布分析** (`get_open_interest_by_strike`): 按 strike 聚合 OI，识别关键支撑/阻力位
+- **Gamma Exposure** (`compute_gamma_exposure`): 计算 GEX Profile、Gamma Flip Level
+- **Max Pain** (`compute_max_pain`): 计算最大痛苦点，预测到期日价格吸引区
+- **IV Term Structure** (`get_iv_term_structure`): ATM IV 期限结构 + 斜率分析
+- **Skew Metrics** (`get_skew_metrics`): RR25d、BF25d 偏斜指标 + 趋势分析
+
+### 工程特性
+
+- **极简输出**: 每个 tool 返回 ≤2KB 紧凑 JSON（硬目标 5KB）
+- **智能缓存**: 双层 TTL 缓存（快速 1s / 慢速 30s）
+- **限速保护**: Token Bucket 限速器，避免触发 API 限制
+- **可解释错误**: `error_code` + `message` + `retry_after_ms`
+- **双模式部署**: 支持 stdio（本地）和 HTTP/SSE（远程）
 
 ## 📦 安装
 
@@ -32,10 +42,9 @@ uv sync --dev
 ### 使用 pip
 
 ```bash
-# 安装
 pip install -e .
 
-# 或者安装开发依赖
+# 安装开发依赖
 pip install -e ".[dev]"
 ```
 
@@ -72,21 +81,6 @@ DERIBIT_HOST=0.0.0.0
 DERIBIT_PORT=8000
 ```
 
-### 🔐 安全要求
-
-⚠️ **重要安全提示**：
-
-1. **永远不要** 将真实 API 密钥提交到代码仓库
-2. 使用 `.env` 文件存储密钥，并将其添加到 `.gitignore`
-3. 定期轮换 API 密钥
-4. 生产环境使用环境变量而非文件
-
-```bash
-# 示例 .env 文件（使用占位符）
-DERIBIT_CLIENT_ID=YOUR_CLIENT_ID
-DERIBIT_CLIENT_SECRET=YOUR_CLIENT_SECRET
-```
-
 ## 🚀 启动服务器
 
 ### 方式 1: stdio 模式（本地 MCP 客户端）
@@ -116,12 +110,14 @@ HTTP 服务器端点：
 - `GET /health` - 健康检查
 - `GET /tools` - 列出所有工具
 - `POST /tools/call` - 调用工具
-- `GET /sse` - SSE 连接（MCP 协议）
-- `POST /mcp/message` - MCP 消息
+- `GET /sse` 或 `GET /mcp/sse` - SSE 连接（MCP 协议）
+- `POST /messages` 或 `POST /mcp/messages` - MCP 消息
 
 ## 🔧 MCP 客户端配置
 
-### CherryStudio / Cursor 配置
+### Cursor 配置
+
+在 Cursor Settings → MCP 中添加：
 
 ```json
 {
@@ -131,26 +127,6 @@ HTTP 服务器端点：
       "args": ["run", "deribit-mcp"],
       "cwd": "/path/to/deribit-mcp-server",
       "env": {
-        "DERIBIT_ENV": "prod",
-        "DERIBIT_ENABLE_PRIVATE": "false",
-        "DERIBIT_CLIENT_ID": "YOUR_CLIENT_ID",
-        "DERIBIT_CLIENT_SECRET": "YOUR_CLIENT_SECRET"
-      }
-    }
-  }
-}
-```
-
-### 使用 Python 直接运行
-
-```json
-{
-  "mcpServers": {
-    "deribit": {
-      "command": "python",
-      "args": ["-m", "deribit_mcp.server"],
-      "cwd": "/path/to/deribit-mcp-server",
-      "env": {
         "DERIBIT_ENV": "prod"
       }
     }
@@ -158,7 +134,7 @@ HTTP 服务器端点：
 }
 ```
 
-### HTTP/SSE 远程连接
+### CherryStudio / HTTP 远程连接
 
 ```json
 {
@@ -171,231 +147,367 @@ HTTP 服务器端点：
 }
 ```
 
-## 🛠️ 可用工具
+---
 
-### Public Tools（默认启用）
+## 🛠️ Options Analytics Tools（新增）
 
-#### 1. `deribit_status`
+### 1. `get_option_chain`
+
+获取指定到期日的期权链数据。
+
+**输入 Schema:**
+```json
+{
+  "currency": "BTC",      // 必填: "BTC" 或 "ETH"
+  "expiry": "28JUN24"     // 必填: 到期日标签
+}
+```
+
+**输出示例:**
+```json
+{
+  "ccy": "BTC",
+  "expiry": "28JUN24",
+  "expiry_ts": 1719561600000,
+  "spot": 67500.0,
+  "atm_strike": 67000,
+  "days_to_expiry": 30.5,
+  "strikes": [
+    {
+      "strike": 65000,
+      "type": "call",
+      "mark_iv": 0.72,        // IV (decimal, 0.72 = 72%)
+      "delta": 0.65,
+      "gamma": 0.00001,
+      "vega": 120.5,
+      "oi": 1500.0,           // Open Interest (contracts)
+      "vol": 250.0            // 24h Volume
+    },
+    {
+      "strike": 65000,
+      "type": "put",
+      "mark_iv": 0.78,
+      "delta": -0.35,
+      "gamma": 0.00001,
+      "vega": 120.5,
+      "oi": 2200.0,
+      "vol": 180.0
+    }
+  ],
+  "summary": {
+    "total_oi": 45000,
+    "total_volume": 8500,
+    "avg_iv": 0.75,
+    "num_strikes": 21
+  },
+  "notes": ["strikes_limited:21_of_85"]
+}
+```
+
+**用途:** 获取完整期权链视图，用于分析 Greeks 分布和 OI 热点。
+
+---
+
+### 2. `get_open_interest_by_strike`
+
+获取按 strike 聚合的 OI 分布。
+
+**输入 Schema:**
+```json
+{
+  "currency": "BTC",      // 必填
+  "expiry": "28JUN24"     // 必填
+}
+```
+
+**输出示例:**
+```json
+{
+  "ccy": "BTC",
+  "expiry": "28JUN24",
+  "spot": 67500.0,
+  "total_call_oi": 85000.0,
+  "total_put_oi": 72000.0,
+  "pcr_total": 0.847,         // Put/Call Ratio
+  "oi_by_strike": [
+    {"strike": 60000, "call_oi": 5000, "put_oi": 12000, "total_oi": 17000, "pcr": 2.4},
+    {"strike": 65000, "call_oi": 8000, "put_oi": 9500, "total_oi": 17500, "pcr": 1.19},
+    {"strike": 70000, "call_oi": 15000, "put_oi": 8000, "total_oi": 23000, "pcr": 0.53}
+  ],
+  "top_strikes": [
+    {"strike": 70000, "call_oi": 15000, "put_oi": 8000, "total_oi": 23000, "pcr": 0.53},
+    {"strike": 65000, "call_oi": 8000, "put_oi": 9500, "total_oi": 17500, "pcr": 1.19}
+  ],
+  "peak_range": {
+    "low": 62000,
+    "high": 72000,
+    "concentration": 0.78       // 78% of OI in this range
+  },
+  "notes": []
+}
+```
+
+**用途:** 识别 OI 峰值区域（潜在支撑/阻力），分析市场定位。
+
+---
+
+### 3. `compute_gamma_exposure`
+
+计算 Gamma Exposure (GEX) Profile。
+
+**输入 Schema:**
+```json
+{
+  "currency": "BTC",                        // 必填
+  "expiries": ["28JUN24", "27DEC24"]        // 可选: 不填则使用最近 3 个到期日
+}
+```
+
+**输出示例:**
+```json
+{
+  "ccy": "BTC",
+  "spot": 67500.0,
+  "expiries_included": ["28JUN24", "27DEC24"],
+  "net_gex": 2.35,                          // 总净 GEX (M$)
+  "gamma_flip": 65800.0,                    // Gamma Flip Level
+  "max_pos_gex_strike": 68000,              // 最大正 GEX 的 strike
+  "max_neg_gex_strike": 72000,              // 最大负 GEX 的 strike
+  "gex_by_strike": [
+    {"strike": 64000, "call_gex": -0.8, "put_gex": 1.2, "net_gex": 0.4},
+    {"strike": 66000, "call_gex": -1.5, "put_gex": 1.8, "net_gex": 0.3},
+    {"strike": 68000, "call_gex": -2.0, "put_gex": 2.8, "net_gex": 0.8},
+    {"strike": 70000, "call_gex": -2.5, "put_gex": 1.5, "net_gex": -1.0}
+  ],
+  "top_positive": [
+    {"strike": 68000, "call_gex": -2.0, "put_gex": 2.8, "net_gex": 0.8}
+  ],
+  "top_negative": [
+    {"strike": 70000, "call_gex": -2.5, "put_gex": 1.5, "net_gex": -1.0}
+  ],
+  "market_maker_positioning": "long_gamma",   // "long_gamma" | "short_gamma" | "neutral"
+  "notes": ["expiries:2"]
+}
+```
+
+**GEX 解读:**
+- **正 GEX (MM Long Gamma)**: MM 在上涨时卖出、下跌时买入 → **稳定市场**
+- **负 GEX (MM Short Gamma)**: MM 在上涨时追买、下跌时追卖 → **放大波动**
+- **Gamma Flip Level**: Net GEX 从正变负的价格点，是关键转折位
+
+**用途:** 判断市场稳定性，识别波动放大区域，优化入场时机。
+
+---
+
+### 4. `compute_max_pain`
+
+计算期权最大痛苦点。
+
+**输入 Schema:**
+```json
+{
+  "currency": "BTC",      // 必填
+  "expiry": "28JUN24"     // 必填
+}
+```
+
+**输出示例:**
+```json
+{
+  "ccy": "BTC",
+  "expiry": "28JUN24",
+  "expiry_ts": 1719561600000,
+  "spot": 67500.0,
+  "max_pain_strike": 65000,
+  "distance_from_spot_pct": -3.70,          // (max_pain - spot) / spot * 100
+  "pain_curve_top3": [
+    {"strike": 65000, "pain": 12500000},    // 最低 pain
+    {"strike": 64000, "pain": 14800000},
+    {"strike": 66000, "pain": 15200000}
+  ],
+  "total_call_oi": 85000.0,
+  "total_put_oi": 72000.0,
+  "pcr": 0.847,
+  "notes": []
+}
+```
+
+**Max Pain 理论:** 到期时价格倾向于向 Max Pain Strike 移动，使期权买方损失最大化。
+
+**用途:** 预测到期日价格吸引区，辅助到期周策略。
+
+---
+
+### 5. `get_iv_term_structure`
+
+获取 ATM IV 期限结构。
+
+**输入 Schema:**
+```json
+{
+  "currency": "BTC",                        // 必填
+  "tenors_days": [7, 14, 30, 60, 90]        // 可选: 默认 [7, 14, 30, 60, 90]
+}
+```
+
+**输出示例:**
+```json
+{
+  "ccy": "BTC",
+  "spot": 67500.0,
+  "term_structure": [
+    {"days": 7, "expiry": "05JAN24", "atm_iv": 0.85, "atm_iv_pct": 85.0},
+    {"days": 14, "expiry": "12JAN24", "atm_iv": 0.78, "atm_iv_pct": 78.0},
+    {"days": 30, "expiry": "28JAN24", "atm_iv": 0.72, "atm_iv_pct": 72.0},
+    {"days": 60, "expiry": "28FEB24", "atm_iv": 0.68, "atm_iv_pct": 68.0},
+    {"days": 90, "expiry": "28MAR24", "atm_iv": 0.65, "atm_iv_pct": 65.0}
+  ],
+  "slope_7d_30d": -3.25,                    // IV% change per 30 days
+  "slope_30d_90d": -1.75,
+  "shape": "backwardation",                 // "contango" | "backwardation" | "flat"
+  "dvol_current": 75.5,
+  "notes": []
+}
+```
+
+**期限结构解读:**
+- **Backwardation**: 短期 IV > 长期 IV → 近期有事件风险
+- **Contango**: 短期 IV < 长期 IV → 市场平静，远期不确定性
+- **Slope**: 斜率越陡，期限结构越扭曲
+
+**用途:** 选择最佳期权到期日，识别 IV 定价机会。
+
+---
+
+### 6. `get_skew_metrics`
+
+获取波动率偏斜指标。
+
+**输入 Schema:**
+```json
+{
+  "currency": "BTC",              // 必填
+  "tenors_days": [7, 30]          // 可选: 默认 [7, 30]
+}
+```
+
+**输出示例:**
+```json
+{
+  "ccy": "BTC",
+  "spot": 67500.0,
+  "skew_by_tenor": [
+    {
+      "days": 7,
+      "expiry": "05JAN24",
+      "atm_iv": 0.85,
+      "rr25d": -0.035,            // RR25d (decimal): Call_IV - Put_IV
+      "rr25d_pct": -3.5,          // RR25d (%)
+      "bf25d": 0.018,             // BF25d (decimal): Wing premium
+      "bf25d_pct": 1.8,           // BF25d (%)
+      "skew_dir": "bearish"       // "bullish" | "bearish" | "neutral"
+    },
+    {
+      "days": 30,
+      "expiry": "28JAN24",
+      "atm_iv": 0.72,
+      "rr25d": -0.025,
+      "rr25d_pct": -2.5,
+      "bf25d": 0.012,
+      "bf25d_pct": 1.2,
+      "skew_dir": "bearish"
+    }
+  ],
+  "skew_trend": "steepening",     // "steepening" | "flattening" | "stable"
+  "summary": {
+    "avg_rr25d_pct": -3.0,
+    "avg_bf25d_pct": 1.5,
+    "dominant_direction": "bearish",
+    "tenors_analyzed": 2
+  },
+  "notes": []
+}
+```
+
+**Skew 解读:**
+- **RR25d < 0 (Bearish)**: Put 比 Call 贵 → 下行保护需求
+- **RR25d > 0 (Bullish)**: Call 比 Put 贵 → 上行投机需求
+- **BF25d > 0**: Wings 比 ATM 贵 → 尾部风险定价高
+- **Steepening**: 短期 skew 比长期更极端 → 近期情绪紧张
+
+**用途:** 判断市场情绪，选择策略方向（看涨/看跌），优化限价单位置。
+
+---
+
+## 🛠️ 基础 Public Tools
+
+### `deribit_status`
 检查 API 连通性和状态。
 
-```json
-// 调用
-{}
+### `deribit_instruments`
+获取可用合约列表（最多 50 个）。
 
-// 返回（~100 bytes）
-{"env":"prod","api_ok":true,"server_time_ms":1700000000000,"notes":[]}
-```
-
-#### 2. `deribit_instruments`
-获取可用合约列表（最多 50 个，优先最近到期）。
-
-```json
-// 调用
-{"currency": "BTC", "kind": "option"}
-
-// 返回（~2KB）
-{
-  "count": 500,
-  "instruments": [
-    {"name":"BTC-28JUN24-70000-C","exp_ts":1719561600000,"strike":70000,"type":"call","tick":0.0001,"size":1}
-  ],
-  "notes": ["truncated_from:500", "nearest_3_expiries"]
-}
-```
-
-#### 3. `deribit_ticker`
+### `deribit_ticker`
 获取紧凑的市场快照。
 
-```json
-// 调用
-{"instrument_name": "BTC-PERPETUAL"}
-
-// 返回（~400 bytes）
-{
-  "inst": "BTC-PERPETUAL",
-  "bid": 50000.0,
-  "ask": 50001.0,
-  "mid": 50000.5,
-  "mark": 50000.25,
-  "idx": 50000.0,
-  "funding": 0.0001,
-  "oi": 1000000,
-  "vol_24h": 50000,
-  "notes": []
-}
-```
-
-#### 4. `deribit_orderbook_summary`
+### `deribit_orderbook_summary`
 获取订单簿摘要（仅 top 5 档）。
 
-```json
-// 调用
-{"instrument_name": "BTC-PERPETUAL", "depth": 20}
-
-// 返回（~800 bytes）
-{
-  "inst": "BTC-PERPETUAL",
-  "bid": 50000.0,
-  "ask": 50001.0,
-  "spread_pts": 1.0,
-  "spread_bps": 2.0,
-  "bids": [{"p":50000,"q":1.5}],
-  "asks": [{"p":50001,"q":2.0}],
-  "bid_depth": 100.5,
-  "ask_depth": 95.3,
-  "imbalance": 0.027,
-  "notes": []
-}
-```
-
-#### 5. `dvol_snapshot`
+### `dvol_snapshot`
 获取 DVOL（Deribit 波动率指数）快照。
 
-```json
-// 调用
-{"currency": "BTC"}
+### `options_surface_snapshot`
+获取波动率曲面快照（ATM IV、RR、BF）。
 
-// 返回（~150 bytes）
-{
-  "ccy": "BTC",
-  "dvol": 80.5,
-  "dvol_chg_24h": 2.5,
-  "percentile": null,
-  "ts": 1700000000000,
-  "notes": []
-}
-```
-
-#### 6. `options_surface_snapshot`
-获取波动率曲面快照（ATM IV、Risk Reversal、Butterfly）。
-
-```json
-// 调用
-{"currency": "BTC", "tenor_days": [7, 14, 30, 60]}
-
-// 返回（~800 bytes）
-{
-  "ccy": "BTC",
-  "spot": 50000.0,
-  "tenors": [
-    {"days":7,"atm_iv":0.82,"rr25":0.02,"fly25":0.01,"fwd":50100},
-    {"days":14,"atm_iv":0.80,"rr25":0.015,"fly25":0.008,"fwd":50200}
-  ],
-  "confidence": 0.85,
-  "ts": 1700000000000,
-  "notes": []
-}
-```
-
-#### 7. `expected_move_iv`
+### `expected_move_iv`
 基于 IV 计算预期波动（1σ）。
 
-```json
-// 调用
-{"currency": "BTC", "horizon_minutes": 60, "method": "dvol"}
-
-// 返回（~350 bytes）
-{
-  "ccy": "BTC",
-  "spot": 50000.0,
-  "iv_used": 0.80,
-  "iv_source": "dvol",
-  "horizon_min": 60,
-  "move_1s_pts": 427.5,
-  "move_1s_bps": 85.5,
-  "up_1s": 50427.5,
-  "down_1s": 49572.5,
-  "confidence": 0.95,
-  "notes": ["dvol_raw:80"]
-}
-```
-
-**公式说明**：
-```
-expected_move = spot × IV_annual × √(T_years)
-where T_years = horizon_minutes / 525600
-
-示例：
-spot = 50000, IV = 80%, horizon = 60 min
-move = 50000 × 0.80 × √(60/525600) ≈ 427.5 点
-```
-
-#### 8. `funding_snapshot`
+### `funding_snapshot`
 获取永续合约资金费率快照。
 
-```json
-// 调用
-{"currency": "BTC"}
+---
 
-// 返回（~400 bytes）
-{
-  "ccy": "BTC",
-  "perp": "BTC-PERPETUAL",
-  "rate": 0.0001,
-  "rate_8h": 0.1095,
-  "next_ts": 1700003600000,
-  "history": [
-    {"ts":1700000000000,"rate":0.0001}
-  ],
-  "notes": []
-}
-```
+## 🔒 Private Tools
 
-### Private Tools（需要 DERIBIT_ENABLE_PRIVATE=true）
+需要 `DERIBIT_ENABLE_PRIVATE=true` 和有效 API 凭证。
 
-#### P1. `account_summary`
-获取账户摘要。
+- `account_summary` - 账户摘要
+- `positions` - 持仓列表
+- `open_orders` - 挂单列表
+- `place_order` - 下单（默认 DRY_RUN）
+- `cancel_order` - 取消订单
 
-```json
-{"currency": "BTC"}
-```
+---
 
-#### P2. `positions`
-获取持仓列表（最多 20 个）。
+## 📊 数值单位规范
 
-```json
-{"currency": "BTC", "kind": "future"}
-```
+| 指标 | 单位 | 示例 |
+|------|------|------|
+| IV (mark_iv, atm_iv) | 小数 (decimal) | `0.80` = 80% |
+| IV (atm_iv_pct) | 百分比 (%) | `80.0` = 80% |
+| RR25d, BF25d | 小数 | `0.025` = 2.5% |
+| RR25d_pct, BF25d_pct | 百分比 | `2.5` = 2.5% |
+| GEX | 百万美元 (M$) | `1.5` = 150万美元 |
+| Pain | 美元 ($) | `12500000` = $12.5M |
+| Slope | IV% 变化/30天 | `-3.25` = 30天内 IV 下降 3.25% |
+| Distance | 百分比 (%) | `-3.7` = 比现价低 3.7% |
 
-#### P3. `open_orders`
-获取挂单列表（最多 20 个）。
-
-```json
-{"currency": "BTC"}
-```
-
-#### P4. `place_order`
-下单（默认 DRY_RUN 模式）。
-
-```json
-{
-  "instrument": "BTC-PERPETUAL",
-  "side": "buy",
-  "type": "limit",
-  "amount": 0.1,
-  "price": 50000
-}
-```
-
-#### P5. `cancel_order`
-取消订单。
-
-```json
-{"order_id": "12345"}
-```
+---
 
 ## 🧪 测试
 
 ```bash
 # 运行所有测试
-uv run pytest
+python3 -m pytest
 
 # 运行测试并显示覆盖率
-uv run pytest --cov=deribit_mcp --cov-report=term-missing
+python3 -m pytest --cov=deribit_mcp --cov-report=term-missing
 
 # 运行特定测试
-uv run pytest tests/test_analytics.py -v
+python3 -m pytest tests/test_analytics.py -v
 ```
+
+---
 
 ## 📁 项目结构
 
@@ -407,10 +519,10 @@ deribit-mcp-server/
 ├── src/
 │   └── deribit_mcp/
 │       ├── __init__.py     # 包初始化
-│       ├── config.py       # 配置管理（pydantic-settings）
+│       ├── config.py       # 配置管理
 │       ├── client.py       # JSON-RPC 客户端（缓存/限速/重试）
 │       ├── models.py       # Pydantic 数据模型
-│       ├── analytics.py    # 分析计算（IV/expected move）
+│       ├── analytics.py    # 分析计算（GEX/MaxPain/Skew）
 │       ├── tools.py        # MCP Tools 实现
 │       ├── server.py       # stdio MCP 服务器
 │       └── http_server.py  # HTTP/SSE 服务器
@@ -421,165 +533,11 @@ deribit-mcp-server/
     └── test_tools.py       # Tools 测试
 ```
 
+---
+
 ## 🔄 部署
 
-### Ubuntu 服务器部署（推荐，带自动重启）
-
-提供完整的安装脚本，支持 systemd 服务管理、自动重启和日志轮转。
-
-#### 一键安装
-
-```bash
-# 克隆项目
-git clone https://github.com/your-repo/deribit-mcp-server.git
-cd deribit-mcp-server
-
-# 运行安装脚本（需要 sudo）
-sudo bash scripts/install.sh
-```
-
-#### 安装脚本功能
-
-- ✅ 自动安装 Python 3.11+ 和依赖
-- ✅ 创建专用系统用户（安全隔离）
-- ✅ 配置 systemd 服务（后台运行）
-- ✅ 自动重启（崩溃后 5 秒内重启）
-- ✅ 日志轮转（保留 14 天）
-- ✅ 资源限制（内存 512MB）
-
-#### 安装后的目录结构
-
-```
-/opt/deribit-mcp/          # 应用目录
-├── src/                   # 源代码
-├── venv/                  # Python 虚拟环境
-└── pyproject.toml
-
-/etc/deribit-mcp/          # 配置目录
-└── config.env             # 配置文件（编辑此文件）
-
-/var/log/deribit-mcp/      # 日志目录
-```
-
-#### 服务管理命令
-
-```bash
-# 查看服务状态
-sudo systemctl status deribit-mcp
-
-# 查看实时日志
-sudo journalctl -u deribit-mcp -f
-
-# 重启服务
-sudo systemctl restart deribit-mcp
-
-# 停止服务
-sudo systemctl stop deribit-mcp
-
-# 启动服务
-sudo systemctl start deribit-mcp
-
-# 禁用开机自启
-sudo systemctl disable deribit-mcp
-```
-
-#### 配置文件编辑
-
-```bash
-# 编辑配置
-sudo nano /etc/deribit-mcp/config.env
-
-# 修改后重启服务
-sudo systemctl restart deribit-mcp
-```
-
-配置文件内容：
-
-```bash
-# 环境选择: prod 或 test
-DERIBIT_ENV=prod
-
-# Private API 开关
-DERIBIT_ENABLE_PRIVATE=false
-
-# API 凭证（替换为真实值）
-DERIBIT_CLIENT_ID=YOUR_CLIENT_ID
-DERIBIT_CLIENT_SECRET=YOUR_CLIENT_SECRET
-
-# HTTP 服务器
-DERIBIT_HOST=0.0.0.0
-DERIBIT_PORT=8000
-```
-
-#### 健康检查与自动恢复
-
-设置定时健康检查（可选）：
-
-```bash
-# 编辑 crontab
-sudo crontab -e
-
-# 添加以下行（每 5 分钟检查一次）
-*/5 * * * * /opt/deribit-mcp/scripts/healthcheck.sh >> /var/log/deribit-mcp/healthcheck.log 2>&1
-```
-
-#### 更新应用
-
-```bash
-# 进入项目目录
-cd /path/to/deribit-mcp-server
-git pull
-
-# 运行更新脚本
-sudo bash scripts/update.sh
-```
-
-#### 卸载
-
-```bash
-sudo bash scripts/uninstall.sh
-```
-
-#### systemd 服务配置详解
-
-服务文件位于 `/etc/systemd/system/deribit-mcp.service`：
-
-```ini
-[Unit]
-Description=Deribit MCP Server (HTTP/SSE)
-After=network-online.target
-
-[Service]
-Type=simple
-User=deribit
-Group=deribit
-
-# 环境配置文件
-EnvironmentFile=/etc/deribit-mcp/config.env
-
-# 启动命令
-ExecStart=/opt/deribit-mcp/venv/bin/python -m deribit_mcp.http_server
-
-# 自动重启配置
-Restart=always           # 总是重启
-RestartSec=5            # 重启间隔 5 秒
-StartLimitIntervalSec=60 # 60 秒内
-StartLimitBurst=3        # 最多重启 3 次
-
-# 资源限制
-MemoryMax=512M
-CPUQuota=100%
-
-# 安全加固
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Docker 部署
+### Docker
 
 ```dockerfile
 FROM python:3.11-slim
@@ -606,25 +564,11 @@ docker run -p 8000:8000 \
   deribit-mcp
 ```
 
-### Render.com 部署
+### systemd 服务
 
-使用项目中的 `render.yaml`：
+参见 `scripts/install.sh` 获取完整的 systemd 服务安装脚本。
 
-```yaml
-services:
-  - type: web
-    name: deribit-mcp
-    runtime: python
-    buildCommand: pip install uv && uv sync
-    startCommand: uv run deribit-mcp-http
-    envVars:
-      - key: DERIBIT_ENV
-        value: prod
-      - key: DERIBIT_CLIENT_ID
-        sync: false
-      - key: DERIBIT_CLIENT_SECRET
-        sync: false
-```
+---
 
 ## 📊 性能目标
 
@@ -635,9 +579,29 @@ services:
 | 缓存命中率 | >80%（正常使用） |
 | API 请求限速 | 8 RPS（可配置） |
 
-## 🤝 贡献
+---
 
-欢迎提交 Issue 和 PR！
+## ⚠️ 错误处理
+
+所有 Tool 返回统一错误格式：
+
+```json
+{
+  "error": true,
+  "error_code": 10001,
+  "message": "Error description (max 100 chars)",
+  "retry_after_ms": 5000,
+  "notes": ["context_info"]
+}
+```
+
+常见错误码：
+- `-1`: 内部错误
+- `404`: 未找到（如无效到期日）
+- `10028`: 请求过快（Rate Limit）
+- `13009`: 认证错误
+
+---
 
 ## 📄 许可证
 
