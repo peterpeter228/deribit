@@ -279,12 +279,238 @@ class PlaceOrderResponse(BaseModel):
 
 
 # =============================================================================
+# Option Chain Models
+# =============================================================================
+
+
+class OptionStrikeData(BaseModel):
+    """Option data for a single strike (compact)."""
+
+    strike: float = Field(description="Strike price")
+    type: Literal["call", "put"] = Field(description="Option type")
+    mark_iv: float | None = Field(default=None, description="Mark IV (decimal, 0.80=80%)")
+    delta: float | None = Field(default=None, description="Delta")
+    gamma: float | None = Field(default=None, description="Gamma")
+    vega: float | None = Field(default=None, description="Vega")
+    oi: float | None = Field(default=None, description="Open interest")
+    vol: float | None = Field(default=None, description="24h volume")
+
+
+class OptionChainResponse(BaseModel):
+    """Response from get_option_chain tool."""
+
+    ccy: Currency = Field(description="Currency: BTC or ETH")
+    expiry: str = Field(description="Expiry label (e.g., 28JUN24)")
+    expiry_ts: int = Field(description="Expiry timestamp (ms)")
+    spot: float = Field(description="Current spot price")
+    atm_strike: float | None = Field(default=None, description="ATM strike")
+    days_to_expiry: float = Field(description="Days until expiration")
+    strikes: list[OptionStrikeData] = Field(max_length=100, description="Option strikes")
+    summary: dict = Field(
+        default_factory=dict,
+        description="Summary stats: total_oi, total_volume, avg_iv"
+    )
+    notes: list[str] = Field(default_factory=list, max_length=6)
+
+
+# =============================================================================
+# Open Interest Models
+# =============================================================================
+
+
+class StrikeOIData(BaseModel):
+    """Open interest by strike (aggregated call+put)."""
+
+    strike: float = Field(description="Strike price")
+    call_oi: float = Field(default=0, description="Call open interest")
+    put_oi: float = Field(default=0, description="Put open interest")
+    total_oi: float = Field(default=0, description="Total open interest")
+    pcr: float | None = Field(default=None, description="Put/Call ratio")
+
+
+class OIPeakInfo(BaseModel):
+    """OI peak information."""
+
+    low: float = Field(description="Lower bound of peak range")
+    high: float = Field(description="Upper bound of peak range")
+    concentration: float = Field(description="% of OI in this range")
+
+
+class OpenInterestByStrikeResponse(BaseModel):
+    """Response from get_open_interest_by_strike tool."""
+
+    ccy: Currency = Field(description="Currency")
+    expiry: str = Field(description="Expiry label")
+    spot: float = Field(description="Current spot price")
+    total_call_oi: float = Field(description="Total call OI")
+    total_put_oi: float = Field(description="Total put OI")
+    pcr_total: float | None = Field(default=None, description="Total put/call ratio")
+    oi_by_strike: list[StrikeOIData] = Field(max_length=50, description="OI by strike")
+    top_strikes: list[StrikeOIData] = Field(max_length=5, description="Top 5 strikes by OI")
+    peak_range: OIPeakInfo | None = Field(default=None, description="OI concentration range")
+    notes: list[str] = Field(default_factory=list, max_length=6)
+
+
+# =============================================================================
+# Gamma Exposure Models
+# =============================================================================
+
+
+class StrikeGEX(BaseModel):
+    """Gamma exposure at a single strike."""
+
+    strike: float = Field(description="Strike price")
+    call_gex: float = Field(default=0, description="Call GEX (M$)")
+    put_gex: float = Field(default=0, description="Put GEX (M$)")
+    net_gex: float = Field(default=0, description="Net GEX (M$)")
+
+
+class GammaExposureResponse(BaseModel):
+    """Response from compute_gamma_exposure tool."""
+
+    ccy: Currency = Field(description="Currency")
+    spot: float = Field(description="Current spot price")
+    expiries_included: list[str] = Field(description="Expiries in calculation")
+    net_gex: float = Field(description="Total net GEX (M$)")
+    gamma_flip: float | None = Field(default=None, description="Gamma flip level")
+    max_pos_gex_strike: float | None = Field(
+        default=None, description="Strike with max positive GEX"
+    )
+    max_neg_gex_strike: float | None = Field(
+        default=None, description="Strike with max negative GEX"
+    )
+    gex_by_strike: list[StrikeGEX] = Field(max_length=50, description="GEX by strike")
+    top_positive: list[StrikeGEX] = Field(max_length=3, description="Top 3 positive GEX")
+    top_negative: list[StrikeGEX] = Field(max_length=3, description="Top 3 negative GEX")
+    market_maker_positioning: Literal["long_gamma", "short_gamma", "neutral"] = Field(
+        description="Overall MM gamma positioning"
+    )
+    notes: list[str] = Field(default_factory=list, max_length=6)
+
+
+# =============================================================================
+# Max Pain Models
+# =============================================================================
+
+
+class PainCurvePoint(BaseModel):
+    """Pain curve data point."""
+
+    strike: float = Field(description="Strike price")
+    pain: float = Field(description="Pain value ($ notional)")
+
+
+class MaxPainResponse(BaseModel):
+    """Response from compute_max_pain tool."""
+
+    ccy: Currency = Field(description="Currency")
+    expiry: str = Field(description="Expiry label")
+    expiry_ts: int = Field(description="Expiry timestamp (ms)")
+    spot: float = Field(description="Current spot price")
+    max_pain_strike: float = Field(description="Max pain strike")
+    distance_from_spot_pct: float = Field(
+        description="Distance from spot (%): (max_pain - spot) / spot * 100"
+    )
+    pain_curve_top3: list[PainCurvePoint] = Field(
+        max_length=3, description="Top 3 low-pain strikes"
+    )
+    total_call_oi: float = Field(description="Total call OI")
+    total_put_oi: float = Field(description="Total put OI")
+    pcr: float | None = Field(default=None, description="Put/Call ratio")
+    notes: list[str] = Field(default_factory=list, max_length=6)
+
+
+# =============================================================================
+# IV Term Structure Models
+# =============================================================================
+
+
+class TermStructurePoint(BaseModel):
+    """Single point on IV term structure."""
+
+    days: int = Field(description="Days to expiry")
+    expiry: str = Field(description="Expiry label")
+    atm_iv: float | None = Field(default=None, description="ATM IV (decimal)")
+    atm_iv_pct: float | None = Field(default=None, description="ATM IV (%)")
+
+
+class IVTermStructureResponse(BaseModel):
+    """Response from get_iv_term_structure tool."""
+
+    ccy: Currency = Field(description="Currency")
+    spot: float = Field(description="Current spot price")
+    term_structure: list[TermStructurePoint] = Field(
+        max_length=10, description="IV by tenor"
+    )
+    slope_7d_30d: float | None = Field(
+        default=None, description="Slope 7d-30d (IV% change per 30 days)"
+    )
+    slope_30d_90d: float | None = Field(
+        default=None, description="Slope 30d-90d (IV% change per 30 days)"
+    )
+    shape: Literal["contango", "backwardation", "flat"] = Field(
+        description="Term structure shape"
+    )
+    dvol_current: float | None = Field(default=None, description="Current DVOL")
+    notes: list[str] = Field(default_factory=list, max_length=6)
+
+
+# =============================================================================
+# Skew Metrics Models
+# =============================================================================
+
+
+class TenorSkew(BaseModel):
+    """Skew metrics for a single tenor."""
+
+    days: int = Field(description="Days to expiry")
+    expiry: str = Field(description="Expiry label")
+    atm_iv: float | None = Field(default=None, description="ATM IV (decimal)")
+    rr25d: float | None = Field(default=None, description="25d risk reversal (decimal)")
+    rr25d_pct: float | None = Field(default=None, description="25d risk reversal (%)")
+    bf25d: float | None = Field(default=None, description="25d butterfly (decimal)")
+    bf25d_pct: float | None = Field(default=None, description="25d butterfly (%)")
+    skew_dir: Literal["bullish", "bearish", "neutral"] | None = Field(
+        default=None, description="Skew direction"
+    )
+
+
+class SkewMetricsResponse(BaseModel):
+    """Response from get_skew_metrics tool."""
+
+    ccy: Currency = Field(description="Currency")
+    spot: float = Field(description="Current spot price")
+    skew_by_tenor: list[TenorSkew] = Field(max_length=6, description="Skew by tenor")
+    skew_trend: Literal["steepening", "flattening", "stable"] | None = Field(
+        default=None, description="Skew trend across tenors"
+    )
+    summary: dict = Field(
+        default_factory=dict,
+        description="Summary: avg_rr25d, avg_bf25d, dominant_direction"
+    )
+    notes: list[str] = Field(default_factory=list, max_length=6)
+
+
+# =============================================================================
 # Error Models
 # =============================================================================
 
 
 class ErrorResponse(BaseModel):
-    """Standard error response."""
+    """Standard error response with retry guidance."""
+
+    error: bool = True
+    error_code: int = Field(description="Error code")
+    message: str = Field(description="Error message")
+    retry_after_ms: int | None = Field(
+        default=None, description="Suggested retry delay (ms)"
+    )
+    notes: list[str] = Field(default_factory=list, max_length=6)
+
+
+# Keep backwards compatibility
+class ErrorResponseLegacy(BaseModel):
+    """Legacy error response for backwards compatibility."""
 
     error: bool = True
     code: int = Field(description="Error code")

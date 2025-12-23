@@ -26,7 +26,6 @@ import logging
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
 
 import uvicorn
 from sse_starlette.sse import EventSourceResponse
@@ -39,7 +38,12 @@ from starlette.routing import Route
 
 from .client import get_client, shutdown_client
 from .config import get_settings, sanitize_log_message
-from .diagnostics import run_full_diagnostics, test_authentication, test_private_api, test_public_api
+from .diagnostics import (
+    run_full_diagnostics,
+    test_authentication,
+    test_private_api,
+    test_public_api,
+)
 from .server import _dispatch_tool, get_private_tools, get_public_tools
 from .tools import deribit_status
 
@@ -76,7 +80,7 @@ class SSESession:
         self.created_at = asyncio.get_event_loop().time()
         self.last_activity = asyncio.get_event_loop().time()
         self._closed = False
-        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: asyncio.Task | None = None
 
     async def send(self, event: str, data: dict):
         """
@@ -121,7 +125,7 @@ class SSESession:
 
 # Global session storage
 _sessions: dict[str, SSESession] = {}
-_shutdown_event: Optional[asyncio.Event] = None
+_shutdown_event: asyncio.Event | None = None
 
 
 async def _cleanup_stale_sessions():
@@ -159,12 +163,12 @@ async def _send_heartbeat(session: SSESession):
         # Wait longer before starting heartbeat to let connection fully establish
         # MCP clients may need time to process initialization
         await asyncio.sleep(30.0)
-        
+
         heartbeat_count = 0
         while not session._closed:
             if session._closed or session.is_timed_out():
                 break
-            
+
             try:
                 # Send heartbeat as MCP notification (optional, some clients don't need it)
                 # Only send if session is still active
@@ -185,10 +189,10 @@ async def _send_heartbeat(session: SSESession):
                 logger.debug(f"Error sending heartbeat for {session.session_id}: {e}")
                 # Don't break on heartbeat errors, just log and continue
                 pass
-            
+
             # Wait for next heartbeat interval
             await asyncio.sleep(session.HEARTBEAT_INTERVAL)
-            
+
     except asyncio.CancelledError:
         logger.debug(f"Heartbeat task cancelled for session {session.session_id}")
     except Exception as e:
@@ -204,7 +208,7 @@ async def health_check(request: Request) -> JSONResponse:
     """Health check endpoint with detailed diagnostics."""
     settings = get_settings()
     client = get_client()
-    
+
     diagnostics = {
         "status": "healthy",
         "env": settings.env.value,
@@ -382,7 +386,7 @@ async def sse_endpoint(request: Request) -> EventSourceResponse:
             while not session._closed:
                 try:
                     message = await asyncio.wait_for(session.queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Keep session alive while the TCP connection is alive.
                     try:
                         if await request.is_disconnected():
@@ -490,11 +494,11 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
         or body.get("session_id")
         or body.get("sessionId")
     )
-    
+
     method = body.get("method")
     params = body.get("params", {})
     request_id = body.get("id")
-    
+
     # Generate request_id if not provided
     if request_id is None:
         request_id = 1
@@ -519,7 +523,7 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
             },
             status_code=400,
         )
-    
+
     if session_id not in _sessions:
         available_sessions = list(_sessions.keys())
         logger.warning(
@@ -533,12 +537,12 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
             logger.debug(f"Full recent session IDs: {recent}")
         else:
             logger.warning("No active sessions available")
-            
+
         # Check if this might be a timing issue (session created but not yet registered)
         # This shouldn't happen, but log it if it does
         logger.debug(f"Request headers: X-Session-Id={request.headers.get('X-Session-Id')}")
         logger.debug(f"Request body session_id: {body.get('session_id')}")
-        
+
         return JSONResponse(
             {
                 "jsonrpc": "2.0",
@@ -552,10 +556,10 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
         )
 
     session = _sessions[session_id]
-    
+
     # Mark activity to prevent timeout
     session.mark_activity()
-    
+
     # Check if session is closed or timed out
     if session._closed or session.is_timed_out():
         return JSONResponse(
@@ -566,7 +570,7 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
             },
             status_code=400,
         )
-    
+
     logger.info(f"MCP message received: {method} (id={request_id}) for session {session_id[:8]}...")
 
     # Handle MCP methods
@@ -612,7 +616,7 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
         try:
             logger.info(f"Executing tool: {tool_name} for session {session_id[:8]}...")
             result = await _dispatch_tool(tool_name, arguments)
-            
+
             # MCP tools/call response format
             response = {
                 "jsonrpc": "2.0",
@@ -626,14 +630,14 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
                     ],
                 },
             }
-            
+
             # Send via SSE FIRST (client is waiting for this)
             await session.send("response", response)
             logger.info(f"Tool {tool_name} response sent via SSE for session {session_id[:8]}...")
-            
+
             # Small delay to ensure SSE message is sent
             await asyncio.sleep(0.05)
-            
+
             # Also return HTTP response
             return JSONResponse(response)
         except Exception as e:
@@ -648,7 +652,7 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
     elif method == "initialize":
         # Handle MCP initialization - this is critical for client connection
         logger.info(f"MCP initialize request for session {session_id} (request_id: {request_id})")
-        
+
         # Get capabilities based on configuration
         settings = get_settings()
         capabilities = {
@@ -656,7 +660,7 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
                 "listChanged": False,  # We don't support dynamic tool changes
             },
         }
-        
+
         # Build initialize response according to MCP spec
         response = {
             "jsonrpc": "2.0",
@@ -670,15 +674,15 @@ async def mcp_message_endpoint(request: Request) -> JSONResponse:
                 },
             },
         }
-        
+
         # Send response via SSE FIRST (this is what the client is waiting for)
         # The client is likely blocking on this response
         await session.send("response", response)
         logger.info(f"MCP initialize response sent via SSE for session {session_id}")
-        
+
         # Small delay to ensure SSE message is sent before HTTP response
         await asyncio.sleep(0.05)
-        
+
         # Also return HTTP response for compatibility
         return JSONResponse(response)
 
@@ -730,10 +734,10 @@ async def test_connection_endpoint(request: Request) -> JSONResponse:
         "public_api": await test_public_api(),
         "authentication": await test_authentication(),
     }
-    
+
     if results["authentication"]["success"]:
         results["private_api"] = await test_private_api()
-    
+
     return JSONResponse(results)
 
 
@@ -747,7 +751,7 @@ async def lifespan(app: Starlette):
     """Application lifespan handler."""
     global _shutdown_event
     _shutdown_event = asyncio.Event()
-    
+
     settings = get_settings()
     logger.info("Starting Deribit MCP HTTP Server")
     logger.info(f"Configuration: {settings.get_safe_config_summary()}")
@@ -760,7 +764,7 @@ async def lifespan(app: Starlette):
     finally:
         # Signal shutdown
         _shutdown_event.set()
-        
+
         # Cancel cleanup task
         cleanup_task.cancel()
         try:
@@ -778,7 +782,7 @@ async def lifespan(app: Starlette):
                     asyncio.gather(*close_tasks, return_exceptions=True),
                     timeout=5.0
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Some SSE sessions did not close within timeout")
         _sessions.clear()
 

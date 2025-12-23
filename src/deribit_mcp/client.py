@@ -271,7 +271,7 @@ class DeribitJsonRpcClient:
             )
             response.raise_for_status()
             data = response.json()
-                
+
         except httpx.TimeoutException as e:
             logger.error(f"Request timeout: {method} after {self.settings.timeout_s}s")
             raise DeribitTimeoutError(
@@ -434,7 +434,7 @@ class DeribitJsonRpcClient:
                         "client_secret": self.settings.client_secret.get_secret_value(),
                     },
                 )
-                
+
                 if not result or "access_token" not in result:
                     raise DeribitAuthError(
                         code=13009,
