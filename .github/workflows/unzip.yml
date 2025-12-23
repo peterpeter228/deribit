@@ -1,0 +1,34 @@
+name: Unzip archive into repo
+
+on:
+  workflow_dispatch:
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: sudo apt-get update && sudo apt-get install -y unzip rsync
+
+      - name: Unzip and move files
+        run: |
+          unzip -o deribit-mcp-server-main-fixed.zip -d _tmp_extract
+          TOPDIR=$(find _tmp_extract -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          if [ -d "$TOPDIR" ]; then
+            rsync -a "$TOPDIR"/ ./
+          else
+            rsync -a _tmp_extract/ ./
+          fi
+          rm -rf _tmp_extract
+          rm -f deribit-mcp-server-main-fixed.zip
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Extract project from zip" || echo "Nothing to commit"
+          git push
